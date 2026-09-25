@@ -2,9 +2,20 @@
 
 # muxel
 
-muxel is an Agent Development Environment (ADE) — a native desktop terminal multiplexer for running several coding agents side by side. It gives you a tiled, tabbed workspace where each pane embeds a real terminal: run Claude Code, opencode, Amp, or plain shells in parallel, track agent status at a glance, and get notified when an agent finishes or needs input.
+**This is my reimagined version of the Muxel ADE.** It keeps the original's
+core idea — a native desktop terminal multiplexer for running several coding
+agents side by side — and rebuilds the experience around driving agents all
+day: a single merged command bar, host-native window chrome, tiled and tabbed
+panes that each embed a real terminal (Claude Code, opencode, Amp, pi, or a
+plain shell), agent status at a glance, notifications when an agent finishes
+or needs input, and first-class git-worktree flows — one window per branch, no
+tmux keybindings required.
 
-It's built for driving multiple agents across git worktrees — one window per branch, no tmux keybindings required. See [FEATURES.md](FEATURES.md) for the full feature catalogue.
+See [FEATURES.md](FEATURES.md) for the full feature catalogue, and
+[docs/dev-main-workflow.md](docs/dev-main-workflow.md) for how this repo
+develops itself: an installed "main" you drive daily, a sandboxed "dev" you
+test uncommitted work in, and one command (`scripts/promote.sh`) to push dev
+over main.
 
 ![muxel running three pi agents in tiled panes under the single merged top bar](docs/img1.png)
 
@@ -58,7 +69,9 @@ side, so you can develop muxel *inside* muxel:
 
 ---
 
-- **Credits** - I want to give credits to the original Muxel developers for making this ADE that allow people to build off of.
+- **Credits** — full credit to the original Muxel developers for building an ADE
+  that invites people to build on it; this repo is my reimagined take on their
+  foundation.
 
 ## License
 
