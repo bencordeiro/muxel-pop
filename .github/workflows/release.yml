@@ -17,6 +17,9 @@ name: release
 # secrets (a paid Apple Developer ID + an App Store Connect notary key) are
 # configured; without them it falls back to ad-hoc signing and Gatekeeper still
 # warns. See scripts/sign-macos.sh for the exact secrets and how to obtain them.
+#
+# Windows is intentionally NOT built or packaged here — support is being phased
+# out, so releases cover Linux (many distros/formats) and macOS only.
 on:
   push:
     tags: ["v*"]

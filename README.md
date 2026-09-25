@@ -37,6 +37,25 @@ over main.
   fontconfig/freetype, and D-Bus (desktop notifications + tray). `git` and
   `tmux` are optional integrations; each agent CLI is installed separately.
 
+## Releases
+
+Pushing a `v*` tag makes GitHub Actions build every package on native runners
+and publish them to
+[GitHub Releases](https://github.com/bencordeiro/muxel-pop/releases) with
+auto-generated notes:
+
+| Platform | Assets |
+| --- | --- |
+| Debian / Ubuntu | `.deb` (x86_64, aarch64) |
+| Fedora / RHEL / openSUSE | `.rpm` (x86_64, aarch64) |
+| Any Linux | AppImage or `.tar.gz` (x86_64, aarch64) |
+| macOS (Intel + Apple Silicon) | one universal `.dmg` + `.zip` |
+
+macOS builds are ad-hoc signed (no Developer ID), so Gatekeeper warns on first
+launch: right-click → Open, or
+`xattr -dr com.apple.quarantine /Applications/muxel.app`. Windows is
+intentionally not packaged — support is being phased out.
+
 ## Dev / main workflow
 
 muxel supports running an installed **main** and a sandboxed **dev** side by
