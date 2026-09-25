@@ -56,6 +56,9 @@ launch: right-click → Open, or
 `xattr -dr com.apple.quarantine /Applications/muxel.app`. Windows is
 intentionally not packaged — support is being phased out.
 
+Tracked-but-unfixed issues (currently: terminal glyph spacing on Arch Linux)
+live in [docs/known-issues.md](docs/known-issues.md).
+
 ## Dev / main workflow
 
 muxel supports running an installed **main** and a sandboxed **dev** side by
