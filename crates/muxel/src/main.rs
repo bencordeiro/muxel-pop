@@ -21,12 +21,30 @@ mod session_binding;
 mod settings_view;
 mod split;
 mod theme;
+mod title_bar;
 mod ui_profile;
 
 use app::MuxelApp;
 use gpui::*;
-use gpui_component::{Root, TitleBar, *};
+use gpui_component::{Root, *};
 use std::borrow::Cow;
+use title_bar::TitleBar;
+
+/// nvm installs node — and npm-global agents like `pi` — under a *versioned*
+/// dir (`~/.nvm/versions/node/vX.Y.Z/bin`) that no static PATH list can name, so
+/// a GUI launch (minimal PATH) wouldn't find them. Discover the newest
+/// installed version's bin dir; `None` when nvm isn't present. Best-effort: any
+/// I/O error just means "no extra dir".
+fn nvm_node_bin_dir(home: Option<&str>) -> Option<String> {
+    let versions = std::path::Path::new(home?).join(".nvm/versions/node");
+    let candidates: Vec<String> = std::fs::read_dir(versions)
+        .ok()?
+        .filter_map(|e| Some(e.ok()?.path().join("bin")))
+        .filter(|p| p.is_dir())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    muxel_core::newest_node_version_bin_dir(&candidates)
+}
 
 /// Persist panic details even when the GUI executable has no useful stderr.
 ///
@@ -245,7 +263,10 @@ fn main() {
     {
         let home = std::env::var("HOME").ok();
         let current = std::env::var("PATH").ok();
-        if let Some(path) = muxel_core::augmented_macos_path(current.as_deref(), home.as_deref()) {
+        let extra: Vec<String> = nvm_node_bin_dir(home.as_deref()).into_iter().collect();
+        if let Some(path) =
+            muxel_core::augmented_macos_path_with(current.as_deref(), home.as_deref(), &extra)
+        {
             // SAFETY: first statement in main, before any thread is spawned.
             unsafe { std::env::set_var("PATH", path) };
         }
@@ -259,7 +280,10 @@ fn main() {
     {
         let home = std::env::var("HOME").ok();
         let current = std::env::var("PATH").ok();
-        if let Some(path) = muxel_core::augmented_linux_path(current.as_deref(), home.as_deref()) {
+        let extra: Vec<String> = nvm_node_bin_dir(home.as_deref()).into_iter().collect();
+        if let Some(path) =
+            muxel_core::augmented_linux_path_with(current.as_deref(), home.as_deref(), &extra)
+        {
             // SAFETY: still single-threaded here (before the GPUI app starts).
             unsafe { std::env::set_var("PATH", path) };
         }
@@ -331,6 +355,30 @@ fn main() {
             })
             .detach();
         });
+}
+
+#[cfg(all(test, unix))]
+mod nvm_path_tests {
+    use super::nvm_node_bin_dir;
+
+    #[test]
+    fn discovers_the_newest_installed_node_version() {
+        let dir = std::env::temp_dir().join(format!("muxel-nvm-test-{}", std::process::id()));
+        for v in ["v18.20.4", "v24.18.0", "vnotsemver"] {
+            std::fs::create_dir_all(dir.join(format!(".nvm/versions/node/{v}/bin"))).unwrap();
+        }
+        // A version dir without a bin/ must not win (or match) at all.
+        std::fs::create_dir_all(dir.join(".nvm/versions/node/v99.0.0")).unwrap();
+        let got = nvm_node_bin_dir(Some(dir.to_str().unwrap())).unwrap();
+        assert!(got.ends_with("/v24.18.0/bin"), "{got}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn missing_nvm_or_home_is_none() {
+        assert_eq!(nvm_node_bin_dir(Some("/nonexistent-muxel")), None);
+        assert_eq!(nvm_node_bin_dir(None), None);
+    }
 }
 
 #[cfg(all(test, unix))]

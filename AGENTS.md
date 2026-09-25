@@ -117,8 +117,40 @@ Unit tests can't see the UI, so for anything visual:
   goes to muxel. On Linux it isolates with `XDG_*`; on macOS (where those are
   ignored) it builds first, then runs only the binary with `HOME` set to
   `.muxel-dev/home` — so agents in its panes start without your login/config.
+- **Installed main vs dev** — `scripts/install.sh` installs the release binary to
+  `~/.local/bin/muxel` (+ launcher entry); `scripts/promote.sh` release-builds and
+  atomically swaps that binary (copy-then-rename, safe while main runs; restart
+  main to switch). Never overwrite the installed binary with `cp` while main is
+  running — rename only, or ETXTBSY. See README "Dev / main workflow".
 - State each visual behavior that needs a human's eyes — the harness can build and
   smoke-test, but can't see colors/layout.
+
+### Updating the installed main (agent checklist)
+
+The user drives an installed **main** (`~/.local/bin/muxel`, real workspace) and
+develops against a sandboxed **dev** (`scripts/dev.sh`, `.muxel-dev/`). When your
+change should reach their local install:
+
+1. Run the gates above, then GUI-test with `scripts/dev.sh` — sandboxed, never
+   touches the real workspace, and coexists with the user's running main.
+2. `scripts/promote.sh` — release-builds and atomically swaps
+   `~/.local/bin/muxel` (copy-then-rename, safe while main runs).
+3. **Never kill or restart the user's running muxel yourself** — they may be
+   working inside it. Tell them the new binary takes effect on their next
+   restart of main.
+4. If `~/.local/bin/muxel` doesn't exist yet, `scripts/install.sh` instead
+   (also registers the launcher icon + `.desktop` entry).
+
+Hard rules while doing this:
+
+- Never `cp`/overwrite `~/.local/bin/muxel` or `target/release/muxel` in place
+  while any muxel is running (ETXTBSY); the scripts unlink/rename correctly.
+- Never launch the installed or built GUI binary "to check" — it has no CLI
+  flags and will boot a full GUI against the **real** workspace. Use the
+  isolated-`HOME` smoke recipe above or `scripts/dev.sh`.
+- Fresh sandbox when needed: `MUXEL_DEV_DIR=/tmp/x scripts/dev.sh`.
+- Full notes: `docs/dev-main-workflow.md`; user-facing summary in README
+  ("Dev / main workflow").
 
 ## Features doc
 

@@ -102,7 +102,10 @@ feature is added or changed, update the matching entry here in the same change**
   environment otherwise omits — on macOS a Dock/Finder launch restores Homebrew and
   `~/.local/bin`; on Linux a desktop-entry / AppImage launch restores `~/.local/bin`,
   `~/.opencode/bin` (opencode's installer default), Linuxbrew, and friends — so
-  agents are detected and spawnable the same as from a terminal.
+  agents are detected and spawnable the same as from a terminal. Version managers
+  are covered too: nvm's versioned node bin dir (`~/.nvm/versions/node/vX.Y.Z/bin`,
+  newest installed version wins) is discovered at startup, so npm-global agents
+  like `pi` resolve under a GUI launch as well.
 - **Graceful launch failure** — if an agent can't be spawned, the pane falls back
   to a shell showing the underlying error instead of crashing. If even the
   fallback shell can't start, the pane shows the failure in place (the toolbar
@@ -539,7 +542,12 @@ feature is added or changed, update the matching entry here in the same change**
 - **Themes** — ~22 bundled themes with a switcher (Catppuccin, Gruvbox, Tokyo
   Night, Solarized, Ayu, Everforest, and more).
 - **Sizing** — whole-app zoom plus independent UI, terminal, and code/diff font
-  sizes.
+  sizes, and an adjustable tab-strip height (Settings → Appearance) for the
+  tab/control bar on every pane — raising it scales the strip's contents with
+  it: tab titles/labels and padding grow continuously, and the strip's buttons
+  and icons step up through size classes. The project sidebar reads one notch
+  larger than the rest of the chrome (rows, headers, and status badges +2px)
+  for legibility.
 - **Keybindings** — configurable shortcuts with a rebind UI, a cheat-sheet overlay
   (`Ctrl+Shift+/`), `Alt+1–9` to jump to a pane's Nth tab, `Ctrl+1–9` to switch to
   the Nth project, `Ctrl+Alt+1–9` to open a new pane running the Nth agent preset,
@@ -595,6 +603,16 @@ feature is added or changed, update the matching entry here in the same change**
 - **Cross-platform** — Linux (x86_64 + arm64) and macOS (Intel + Apple Silicon).
 - **Desktop integration** — app icon and a `.desktop` launcher entry (also the
   notification icon).
+- **Host window controls** — muxel defers minimize/maximize/close to the host
+  OS's window decorations whenever the window manager provides them (X11, and
+  Wayland compositors with `xdg-decoration`), instead of painting a duplicate
+  set. On compositors that force client-side decorations (e.g. GNOME Wayland)
+  muxel draws its own controls so buttons are never missing. The in-app top bar
+  is a single merged row: pane/agent controls (preset, Run task, Loops,
+  Snippets, tmux/worktree/restart/close, git-diff) starting at the sidebar
+  divider, then Search pushed right alongside the workspace switcher,
+  dashboard, notifications, and Settings (outermost). Merging the old separate
+  toolbar into the title bar frees a full row of vertical space for panes.
 - **Linux: self-cleaning AppImage mounts** — a muxel instance run from an
   AppImage that crashes or is SIGKILLed can't unmount its squashfuse mount, and a
   dead leftover mount makes any filesystem scan (a desktop monitor's periodic

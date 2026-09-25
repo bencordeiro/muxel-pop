@@ -52,14 +52,66 @@ const LINUX_USER_SUBDIRS: &[&str] = &[
 /// when `current` already contains all of them (e.g. a terminal launch) so the
 /// caller can skip the `set_var`.
 pub fn augmented_macos_path(current: Option<&str>, home_dir: Option<&str>) -> Option<String> {
-    augment(MACOS_GUI_PATH_DIRS, MACOS_USER_SUBDIRS, current, home_dir)
+    augmented_macos_path_with(current, home_dir, &[])
+}
+
+/// [`augmented_macos_path`] plus caller-discovered dirs (e.g. nvm's versioned
+/// node bin dir, which no static list can name).
+pub fn augmented_macos_path_with(
+    current: Option<&str>,
+    home_dir: Option<&str>,
+    extra_dirs: &[String],
+) -> Option<String> {
+    augment(
+        MACOS_GUI_PATH_DIRS,
+        MACOS_USER_SUBDIRS,
+        extra_dirs,
+        current,
+        home_dir,
+    )
 }
 
 /// Linux counterpart of [`augmented_macos_path`] for desktop-entry / AppImage
 /// launches — prepends the dirs where agents like opencode install. `None` when
 /// `current` already has them all.
 pub fn augmented_linux_path(current: Option<&str>, home_dir: Option<&str>) -> Option<String> {
-    augment(LINUX_GUI_PATH_DIRS, LINUX_USER_SUBDIRS, current, home_dir)
+    augmented_linux_path_with(current, home_dir, &[])
+}
+
+/// [`augmented_linux_path`] plus caller-discovered dirs (e.g. nvm's versioned
+/// node bin dir, which no static list can name).
+pub fn augmented_linux_path_with(
+    current: Option<&str>,
+    home_dir: Option<&str>,
+    extra_dirs: &[String],
+) -> Option<String> {
+    augment(
+        LINUX_GUI_PATH_DIRS,
+        LINUX_USER_SUBDIRS,
+        extra_dirs,
+        current,
+        home_dir,
+    )
+}
+
+/// Picks the newest node version's bin dir from nvm-style candidates
+/// (`$HOME/.nvm/versions/node/vX.Y.Z/bin`): pure selection over the version in
+/// each candidate's second-to-last path component. Unparseable entries are
+/// ignored; `None` when none parse.
+pub fn newest_node_version_bin_dir(candidates: &[String]) -> Option<String> {
+    fn parse_ver(comp: &str) -> Option<(u32, u32, u32)> {
+        let v = comp.strip_prefix('v').unwrap_or(comp);
+        let mut it = v.split('.');
+        let maj: u32 = it.next()?.parse().ok()?;
+        let min: u32 = it.next().unwrap_or("0").parse().ok()?;
+        let pat: u32 = it.next().unwrap_or("0").split('-').next()?.parse().ok()?;
+        Some((maj, min, pat))
+    }
+    candidates
+        .iter()
+        .filter_map(|c| Some((parse_ver(c.rsplit('/').nth(1)?)?, c)))
+        .max_by_key(|(v, _)| *v)
+        .map(|(_, c)| c.clone())
 }
 
 /// Shared core: prepend the `system_dirs` and `$HOME/<user_subdirs>` that are
@@ -70,6 +122,7 @@ pub fn augmented_linux_path(current: Option<&str>, home_dir: Option<&str>) -> Op
 fn augment(
     system_dirs: &[&str],
     user_subdirs: &[&str],
+    extra_dirs: &[String],
     current: Option<&str>,
     home_dir: Option<&str>,
 ) -> Option<String> {
@@ -80,6 +133,7 @@ fn augment(
             candidates.push(format!("{home}/{sub}"));
         }
     }
+    candidates.extend(extra_dirs.iter().cloned());
 
     let existing: Vec<&str> = current.map(|p| p.split(':').collect()).unwrap_or_default();
     let present: std::collections::HashSet<&str> = existing.iter().copied().collect();
@@ -99,7 +153,50 @@ fn augment(
 
 #[cfg(test)]
 mod tests {
-    use super::{augmented_linux_path, augmented_macos_path};
+    use super::{
+        augmented_linux_path, augmented_macos_path, augmented_macos_path_with,
+        newest_node_version_bin_dir,
+    };
+
+    #[test]
+    fn picks_the_newest_nvm_node_version() {
+        let candidates: Vec<String> = [
+            "/h/.nvm/versions/node/v9.9.9/bin",
+            "/h/.nvm/versions/node/v24.18.0/bin",
+            "/h/.nvm/versions/node/v18.20.4/bin",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        assert_eq!(
+            newest_node_version_bin_dir(&candidates).as_deref(),
+            Some("/h/.nvm/versions/node/v24.18.0/bin")
+        );
+    }
+
+    #[test]
+    fn ignores_unparseable_nvm_entries_and_empty_input() {
+        let candidates: Vec<String> = [
+            "/h/.nvm/versions/node/garbage/bin",
+            "/h/.nvm/versions/node/bin",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        assert_eq!(newest_node_version_bin_dir(&candidates), None);
+        assert_eq!(newest_node_version_bin_dir(&[]), None);
+    }
+
+    #[test]
+    fn extra_dirs_are_prepended_like_the_static_ones() {
+        let out = augmented_macos_path_with(
+            Some("/usr/bin:/bin"),
+            Some("/Users/x"),
+            &["/Users/x/.nvm/versions/node/v24.18.0/bin".to_string()],
+        )
+        .unwrap();
+        assert!(out.starts_with("/opt/homebrew/bin:"));
+        assert!(out.contains(":/Users/x/.nvm/versions/node/v24.18.0/bin:"));
+        assert!(out.ends_with(":/usr/bin:/bin"));
+    }
 
     #[test]
     fn prepends_missing_dirs_before_existing_path() {

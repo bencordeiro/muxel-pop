@@ -20,13 +20,16 @@ pub use agent::{
     AgentPreset, EnvVar, InjectionMode, MEMORY_DIR, MEMORY_FILE, PresetKind, ResolvedLaunch,
     append_agent_instruction, claude_session_path, codex_developer_instructions_override,
     codex_latest_session_id, codex_session_exists, codex_session_id_from_title,
-    codex_session_matches_cwd, codex_session_names, codex_terminal_title_override,
-    memory_header, memory_instruction, memory_reference, resolve_launch,
-    resolve_launch_for_session, session_resume_args,
+    codex_session_matches_cwd, codex_session_names, codex_terminal_title_override, memory_header,
+    memory_instruction, memory_reference, resolve_launch, resolve_launch_for_session,
+    session_resume_args,
 };
 pub use appimage::{foreign_muxel_appimage_mounts, own_appimage};
 pub use diff::{SplitRow, split_diff};
-pub use gui_path::{augmented_linux_path, augmented_macos_path};
+pub use gui_path::{
+    augmented_linux_path, augmented_linux_path_with, augmented_macos_path,
+    augmented_macos_path_with, newest_node_version_bin_dir,
+};
 pub use pane::{
     FocusDir, LeafData, PaneNode, SplitDirection, add_tab, add_tab_at, focus_in_direction,
     move_into_split, move_into_tabs, move_pane_beside, move_tab_to, remove, set_active_tab,
@@ -1220,6 +1223,10 @@ fn default_ui_font_size() -> f32 {
     16.0
 }
 
+fn default_tab_strip_height() -> f32 {
+    28.0
+}
+
 fn default_zoom() -> f32 {
     1.0
 }
@@ -1524,6 +1531,10 @@ pub struct Settings {
     /// Interface (non-terminal) base font size; scales all UI text + spacing.
     #[serde(default = "default_ui_font_size")]
     pub ui_font_size: f32,
+    /// Height of each pane's tab/control strip in px at base UI scale; rendered
+    /// in rems so it scales with UI zoom like the rest of the chrome.
+    #[serde(default = "default_tab_strip_height")]
+    pub tab_strip_height: f32,
     #[serde(default = "default_zoom")]
     pub zoom: f32,
     /// Pane border intensity: "off" | "subtle" | "bold".
@@ -1790,6 +1801,7 @@ impl Default for Settings {
             font_family: String::new(),
             font_size: 14.0,
             ui_font_size: 16.0,
+            tab_strip_height: 28.0,
             zoom: 1.0,
             pane_border: "subtle".to_string(),
             terminal_mouse: "copy_paste".to_string(),

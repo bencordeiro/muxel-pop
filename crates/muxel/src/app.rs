@@ -21,6 +21,9 @@ use gpui_component::spinner::Spinner;
 use gpui_component::tag::Tag;
 use gpui_component::text::markdown;
 use gpui_component::{button::*, *};
+// Shadows `gpui_component::TitleBar` from the glob above: muxel's own title bar
+// omits the app-drawn window controls so they don't duplicate the host OS's.
+use crate::title_bar::TitleBar;
 use muxel_core::autopilot::{self, AutoAction, AutoContinue, PaneActivity};
 use muxel_core::memory::{self, MemoryEntry};
 use muxel_core::{
@@ -28,11 +31,11 @@ use muxel_core::{
     InstanceKind, Loop, LoopSchedule, MEMORY_DIR, MEMORY_FILE, PaneNode, PostRunAction, Project,
     ResolvedLaunch, Runner, Snippet, SplitDirection, StartupAgent, Workspace, WorkspaceMeta,
     WorkspacesIndex, Worktree, add_tab, add_tab_at, agent_activity_label, append_agent_instruction,
-    codex_developer_instructions_override, focus_in_direction,
-    memory_instruction, memory_reference, migrate_worktrees, move_into_split, move_into_tabs,
-    move_pane_beside, move_tab_to, remove, resolve_launch_for_session, set_active_tab,
-    set_split_sizes, set_tab_order, split, split_beside, swap_instances, swap_panes,
-    sync_agent_injection_modes, sync_codex_approval_args,
+    codex_developer_instructions_override, focus_in_direction, memory_instruction,
+    memory_reference, migrate_worktrees, move_into_split, move_into_tabs, move_pane_beside,
+    move_tab_to, remove, resolve_launch_for_session, set_active_tab, set_split_sizes,
+    set_tab_order, split, split_beside, swap_instances, swap_panes, sync_agent_injection_modes,
+    sync_codex_approval_args,
 };
 use muxel_terminal::{
     AgentStatus, CommandSpec, TerminalLaunch, TerminalMouseMode, TerminalSession, TerminalView,
@@ -886,13 +889,23 @@ fn preset_icon_obj(preset: &AgentPreset) -> Icon {
     Icon::empty().path(preset_icon_path(preset))
 }
 
+/// Stop a title-bar child's mouse-down from reaching the bar's window-drag
+/// handler — a click with the slightest movement would otherwise start a window
+/// move and swallow the click.
+fn nodrag(el: impl IntoElement) -> Div {
+    div()
+        .flex()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(el)
+}
+
 /// A small status pill for an agent.
 fn status_tag(status: AgentStatus, label: String) -> Tag {
     match status {
-        AgentStatus::Working => Tag::primary().small().child(label),
-        AgentStatus::Idle => Tag::new().small().child(label),
-        AgentStatus::Blocked => Tag::warning().small().child(label),
-        AgentStatus::Done => Tag::success().small().child(label),
+        AgentStatus::Working => Tag::primary().child(label),
+        AgentStatus::Idle => Tag::new().child(label),
+        AgentStatus::Blocked => Tag::warning().child(label),
+        AgentStatus::Done => Tag::success().child(label),
     }
 }
 
@@ -5940,7 +5953,7 @@ impl MuxelApp {
         let title = format!("diff — {fname}");
         let opened = cx.open_window(
             gpui::WindowOptions {
-                titlebar: Some(gpui_component::TitleBar::title_bar_options()),
+                titlebar: Some(TitleBar::title_bar_options()),
                 window_min_size: Some(size(px(400.0), px(300.0))),
                 ..Default::default()
             },
@@ -5981,7 +5994,7 @@ impl MuxelApp {
         let app = cx.weak_entity();
         let opened = cx.open_window(
             gpui::WindowOptions {
-                titlebar: Some(gpui_component::TitleBar::title_bar_options()),
+                titlebar: Some(TitleBar::title_bar_options()),
                 window_min_size: Some(size(px(420.0), px(280.0))),
                 ..Default::default()
             },
@@ -10654,7 +10667,7 @@ impl MuxelApp {
                 std::rc::Rc::new(std::cell::RefCell::new(None));
             let opened = cx.open_window(
                 gpui::WindowOptions {
-                    titlebar: Some(gpui_component::TitleBar::title_bar_options()),
+                    titlebar: Some(TitleBar::title_bar_options()),
                     window_bounds,
                     display_id: Some(display_id),
                     app_id: Some("muxel".to_string()),
@@ -11177,7 +11190,7 @@ impl MuxelApp {
             std::rc::Rc::new(std::cell::RefCell::new(None));
         let opened = cx.open_window(
             gpui::WindowOptions {
-                titlebar: Some(gpui_component::TitleBar::title_bar_options()),
+                titlebar: Some(TitleBar::title_bar_options()),
                 window_min_size: Some(size(px(360.0), px(240.0))),
                 ..Default::default()
             },
@@ -13674,6 +13687,13 @@ impl MuxelApp {
                 // tab drag or focus change.
                 let sid = iid.simple();
                 let kind = inst.map(|i| i.kind).unwrap_or_default();
+                // Strip content scales with the tab-strip height setting: text,
+                // padding and dots continuously (rems), buttons/icons in size
+                // steps ([`Self::strip_btn_size`]). `su` folds in the UI zoom so
+                // px-sized glyphs (agent icons, pin) track it too.
+                let strip_scale = self.settings.tab_strip_height / 28.0;
+                let sz = self.strip_btn_size();
+                let su = strip_scale * (f32::from(cx.theme().font_size) / 16.0);
                 let max_icon = if self.maximized.is_some_and(|m| tabs.contains(&m)) {
                     IconName::Minimize
                 } else {
@@ -13683,12 +13703,12 @@ impl MuxelApp {
                     .flex_none()
                     .flex()
                     .items_center()
-                    .gap(px(1.0))
+                    .gap(rems(0.0625 * strip_scale))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
                         Button::new(SharedString::from(format!("split-h-{sid}")))
                             .ghost()
-                            .xsmall()
+                            .with_size(sz)
                             .icon(IconName::PanelRight)
                             .tooltip(t("Split right; right-click to choose agent"))
                             .on_click(cx.listener(move |this, _e, window, cx| {
@@ -13715,7 +13735,7 @@ impl MuxelApp {
                     .child(
                         Button::new(SharedString::from(format!("split-v-{sid}")))
                             .ghost()
-                            .xsmall()
+                            .with_size(sz)
                             .icon(IconName::PanelBottom)
                             .tooltip(t("Split down; right-click to choose agent"))
                             .on_click(cx.listener(move |this, _e, window, cx| {
@@ -13745,7 +13765,7 @@ impl MuxelApp {
                         let on = self.auto_continue_on(iid);
                         Button::new(SharedString::from(format!("auto-{sid}")))
                             .ghost()
-                            .xsmall()
+                            .with_size(sz)
                             .selected(on)
                             .label(t("Auto"))
                             .tooltip(if on {
@@ -13760,7 +13780,7 @@ impl MuxelApp {
                     .children((kind == InstanceKind::Terminal).then(|| {
                         Button::new(SharedString::from(format!("diff-{sid}")))
                             .ghost()
-                            .xsmall()
+                            .with_size(sz)
                             .icon(Icon::empty().path("icons/diff.svg"))
                             .tooltip(t("Show changes (git diff)"))
                             .on_click(cx.listener(move |this, _e, window, cx| {
@@ -13770,7 +13790,7 @@ impl MuxelApp {
                     .children((kind == InstanceKind::Diff).then(|| {
                         Button::new(SharedString::from(format!("refresh-{sid}")))
                             .ghost()
-                            .xsmall()
+                            .with_size(sz)
                             .label("↻")
                             .tooltip(t("Refresh diff"))
                             .on_click(cx.listener(move |this, _e, window, cx| {
@@ -13786,7 +13806,7 @@ impl MuxelApp {
                                 let rendered = e.read(cx).show_rendered();
                                 Button::new(SharedString::from(format!("md-{sid}")))
                                     .ghost()
-                                    .xsmall()
+                                    .with_size(sz)
                                     .label(if rendered { t("Raw") } else { t("Rendered") })
                                     .tooltip(if rendered {
                                         t("Show raw text")
@@ -13807,7 +13827,7 @@ impl MuxelApp {
                             .map(|_| {
                                 Button::new(SharedString::from(format!("preview-html-{sid}")))
                                     .ghost()
-                                    .xsmall()
+                                    .with_size(sz)
                                     .label(t("Preview"))
                                     .tooltip(t("Preview HTML in the browser"))
                                     .on_click(cx.listener(move |this, _e, window, cx| {
@@ -13828,7 +13848,7 @@ impl MuxelApp {
                     .child(
                         Button::new(SharedString::from(format!("max-{sid}")))
                             .ghost()
-                            .xsmall()
+                            .with_size(sz)
                             .icon(max_icon)
                             .tooltip(t("Maximize"))
                             .on_click(
@@ -13838,7 +13858,7 @@ impl MuxelApp {
                     .child(
                         Button::new(SharedString::from(format!("popout-{sid}")))
                             .ghost()
-                            .xsmall()
+                            .with_size(sz)
                             .icon(IconName::ExternalLink)
                             .tooltip(t("Pop out"))
                             .on_click(cx.listener(move |this, _e, window, cx| {
@@ -13848,7 +13868,7 @@ impl MuxelApp {
                     .child(
                         Button::new(SharedString::from(format!("close-{sid}")))
                             .ghost()
-                            .xsmall()
+                            .with_size(sz)
                             .icon(IconName::Close)
                             .tooltip(t("Close"))
                             .on_click(cx.listener(move |this, _e, _w, cx| {
@@ -14156,19 +14176,22 @@ impl MuxelApp {
                             })
                             .child(agent_icon(
                                 tab_program.as_deref(),
-                                px(12.0),
+                                px(12.0 * su),
                                 cx.theme().muted_foreground,
                             ))
                             // A tab in a worktree always shows its color dot.
-                            .children(
-                                tab_wt_colors[i]
-                                    .map(|c| div().size(px(6.0)).rounded_full().flex_none().bg(c)),
-                            )
+                            .children(tab_wt_colors[i].map(|c| {
+                                div()
+                                    .size(rems(0.375 * strip_scale))
+                                    .rounded_full()
+                                    .flex_none()
+                                    .bg(c)
+                            }))
                             // Pinned tabs show a pin glyph before the title.
                             .children(tab_pinned.then(|| {
                                 svg()
                                     .path("icons/pin.svg")
-                                    .size(px(10.0))
+                                    .size(px(10.0 * su))
                                     .flex_none()
                                     .text_color(cx.theme().muted_foreground)
                             }))
@@ -14194,7 +14217,7 @@ impl MuxelApp {
                                             tab.simple()
                                         )))
                                         .ghost()
-                                        .xsmall()
+                                        .with_size(sz)
                                         .icon(IconName::Close)
                                         .tooltip(t("Close tab"))
                                         .on_click(
@@ -14239,7 +14262,7 @@ impl MuxelApp {
                     .child(
                         Button::new(SharedString::from(format!("newtab-{sid}")))
                             .ghost()
-                            .xsmall()
+                            .with_size(sz)
                             .icon(IconName::Plus)
                             .tooltip(t("New tab agent"))
                             .on_click(cx.listener(move |this, _e, window, cx| {
@@ -14270,11 +14293,11 @@ impl MuxelApp {
                 let strip = div()
                     .id(SharedString::from(format!("strip-{}", anchor.simple())))
                     .flex_none()
-                    .h(rems(1.75))
+                    .h(rems(self.settings.tab_strip_height / 16.0))
                     .flex()
                     .items_center()
                     .bg(header_bg)
-                    .text_xs()
+                    .text_size(rems(0.75 * strip_scale))
                     .text_color(cx.theme().muted_foreground)
                     .cursor_pointer()
                     // Drag the title bar to move the whole pane (→ swap on drop).
@@ -14314,11 +14337,17 @@ impl MuxelApp {
                             .flex()
                             .items_center()
                             .gap_1()
-                            .px_2()
+                            .px(rems(0.5 * strip_scale))
                             .h_full()
                             .border_l_1()
                             .border_color(cx.theme().border)
-                            .child(div().size(px(7.0)).rounded_full().flex_none().bg(c));
+                            .child(
+                                div()
+                                    .size(rems(0.4375 * strip_scale))
+                                    .rounded_full()
+                                    .flex_none()
+                                    .bg(c),
+                            );
                         if renaming {
                             badge
                                 .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _w, cx| {
@@ -14328,7 +14357,7 @@ impl MuxelApp {
                                 }))
                                 .child(
                                     div()
-                                        .w(px(110.0))
+                                        .w(rems(6.875 * strip_scale))
                                         .min_w_0()
                                         .child(Input::new(&self.rename_input).w_full().min_w_0()),
                                 )
@@ -14352,8 +14381,8 @@ impl MuxelApp {
                                 )
                                 .child(
                                     div()
-                                        .text_xs()
-                                        .max_w(px(110.0))
+                                        .text_size(rems(0.75 * strip_scale))
+                                        .max_w(rems(6.875 * strip_scale))
                                         .overflow_hidden()
                                         .whitespace_nowrap()
                                         .text_ellipsis()
@@ -15588,7 +15617,7 @@ impl MuxelApp {
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_xs()
+                    .text_size(rems(0.875))
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
@@ -15596,13 +15625,13 @@ impl MuxelApp {
             )
             .child(
                 div()
-                    .text_xs()
+                    .text_size(rems(0.875))
                     .text_color(cx.theme().muted_foreground)
                     .child(branch),
             )
             .children((count > 0).then(|| {
                 div()
-                    .text_xs()
+                    .text_size(rems(0.875))
                     .text_color(cx.theme().muted_foreground)
                     .child(format!("{count}"))
             }))
@@ -15653,7 +15682,7 @@ impl MuxelApp {
                 div()
                     .pl_6()
                     .py_1()
-                    .text_xs()
+                    .text_size(rems(0.875))
                     .text_color(cx.theme().muted_foreground)
                     .child(msg)
             };
@@ -15696,7 +15725,7 @@ impl MuxelApp {
                     .px_3()
                     .pt_3()
                     .pb_1()
-                    .text_xs()
+                    .text_size(rems(0.875))
                     .font_semibold()
                     .text_color(cx.theme().muted_foreground)
                     .child(t("PROJECTS")),
@@ -15736,7 +15765,7 @@ impl MuxelApp {
                 .flex()
                 .items_center()
                 .gap_1()
-                .text_sm()
+                .text_size(rems(1.0))
                 .bg(if active {
                     cx.theme().sidebar_accent
                 } else {
@@ -15814,7 +15843,7 @@ impl MuxelApp {
                                         // A little breathing room before the trailing
                                         // icon buttons (file browser / memory).
                                         .mr_1()
-                                        .text_xs()
+                                        .text_size(rems(0.875))
                                         .text_color(cx.theme().muted_foreground)
                                         .child(
                                             // currentColor stroke → must set the color
@@ -16373,7 +16402,7 @@ impl MuxelApp {
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_ellipsis()
-                                    .text_xs()
+                                    .text_size(rems(0.875))
                                     .text_color(cx.theme().sidebar_foreground)
                                     .child(display),
                             )
@@ -16487,22 +16516,11 @@ impl MuxelApp {
         )
     }
 
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut bar = div()
-            .flex_none()
-            .h(rems(2.5))
-            .px_2()
-            .flex()
-            .items_center()
-            .gap_1()
-            .bg(cx.theme().title_bar)
-            // Click the toolbar chrome to deselect the active pane (so Ctrl+P and
-            // other muxel shortcuts go to muxel instead of the focused terminal).
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _e: &MouseDownEvent, window, cx| this.deselect_pane(window, cx)),
-            );
-
+    /// The pane/agent controls (preset split-button, Run task, Loops, Snippets,
+    /// tmux/worktree/restart/close, git-diff). Shared by the merged top bar and
+    /// the standalone toolbar. Every control is wrapped in [`nodrag`] so a click
+    /// never reaches the title bar's window-drag handler.
+    fn toolbar_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // Preset split-button: the body opens a new pane with the current
         // preset; the caret picks the active preset / sets the default.
         let current = self.current_agent_preset();
@@ -16523,42 +16541,46 @@ impl MuxelApp {
                 )
             })
             .collect();
-        bar = bar.child(
-            DropdownButton::new("preset-run")
-                .button(
-                    Button::new("preset-run-btn")
-                        .ghost()
-                        .small()
-                        .icon(current_icon)
-                        .label(current_name.clone())
-                        .tooltip(t("New pane with the current preset"))
-                        .on_click(cx.listener(|this, _ev, window, cx| {
-                            this.add_agent(SplitDirection::Horizontal, window, cx)
-                        })),
-                )
-                .dropdown_menu(move |mut menu, _window, _cx| {
-                    for (id, name, is_default, icon_path) in preset_items.iter() {
-                        let label = if *is_default {
-                            format!("★ {name}")
-                        } else {
-                            name.clone()
-                        };
-                        menu = menu.menu_with_icon(
-                            label,
-                            Icon::empty().path(icon_path.clone()),
-                            Box::new(SetPreset(*id)),
-                        );
-                    }
-                    menu = menu.separator();
-                    menu.menu(
-                        t("Set current as default"),
-                        Box::new(SetDefaultPreset(current_id)),
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_1()
+            .child(nodrag(
+                DropdownButton::new("preset-run")
+                    .button(
+                        Button::new("preset-run-btn")
+                            .ghost()
+                            .small()
+                            .icon(current_icon)
+                            .label(current_name.clone())
+                            .tooltip(t("New pane with the current preset"))
+                            .on_click(cx.listener(|this, _ev, window, cx| {
+                                this.add_agent(SplitDirection::Horizontal, window, cx)
+                            })),
                     )
-                }),
-        );
-
-        bar.child(div().w(px(6.0)))
-            .child(
+                    .dropdown_menu(move |mut menu, _window, _cx| {
+                        for (id, name, is_default, icon_path) in preset_items.iter() {
+                            let label = if *is_default {
+                                format!("★ {name}")
+                            } else {
+                                name.clone()
+                            };
+                            menu = menu.menu_with_icon(
+                                label,
+                                Icon::empty().path(icon_path.clone()),
+                                Box::new(SetPreset(*id)),
+                            );
+                        }
+                        menu = menu.separator();
+                        menu.menu(
+                            t("Set current as default"),
+                            Box::new(SetDefaultPreset(current_id)),
+                        )
+                    }),
+            ))
+            .child(div().w(px(6.0)))
+            .child(nodrag(
                 Button::new("run-task")
                     .ghost()
                     .small()
@@ -16572,8 +16594,8 @@ impl MuxelApp {
                             cx.notify();
                         }),
                     ),
-            )
-            .child(
+            ))
+            .child(nodrag(
                 Button::new("loops-btn")
                     .ghost()
                     .small()
@@ -16587,8 +16609,8 @@ impl MuxelApp {
                             cx.notify();
                         }),
                     ),
-            )
-            .child(
+            ))
+            .child(nodrag(
                 Button::new("snippets-btn")
                     .ghost()
                     .small()
@@ -16602,49 +16624,67 @@ impl MuxelApp {
                             cx.notify();
                         }),
                     ),
-            )
+            ))
             .child(div().w(px(6.0)))
-            .child(
+            .child(nodrag(
                 Button::new("toggle-tmux")
                     .ghost()
                     .icon(IconName::SquareTerminal)
                     .selected(self.use_tmux)
                     .tooltip(t("Run in a tmux session"))
                     .on_click(cx.listener(|this, _ev, _window, cx| this.toggle_tmux(cx))),
-            )
-            .child(
+            ))
+            .child(nodrag(
                 Button::new("toggle-worktree")
                     .ghost()
                     .icon(Icon::empty().path("icons/git-branch.svg"))
                     .selected(self.use_worktree)
                     .tooltip(t("Create a git worktree"))
                     .on_click(cx.listener(|this, _ev, _window, cx| this.toggle_worktree(cx))),
-            )
-            .child(
+            ))
+            .child(nodrag(
                 Button::new("restart")
                     .ghost()
                     .icon(IconName::Play)
                     .disabled(!self.active_is_terminal())
                     .tooltip(t("Restart agent"))
                     .on_click(cx.listener(|this, _ev, window, cx| this.restart_active(window, cx))),
-            )
-            .child(
+            ))
+            .child(nodrag(
                 Button::new("close")
                     .ghost()
                     .icon(IconName::Close)
                     .tooltip(t("Close pane"))
                     .on_click(cx.listener(|this, _ev, window, cx| this.close_active(window, cx))),
-            )
-            // Spacer pushes the git-diff toggle to the far right of the toolbar.
-            .child(div().flex_1())
-            .child(
+            ))
+            .child(nodrag(
                 Button::new("toggle-git-diff")
                     .ghost()
                     .icon(Icon::empty().path("icons/diff.svg"))
                     .selected(self.show_git_diff)
                     .tooltip(t("Git diff"))
                     .on_click(cx.listener(|this, _ev, _w, cx| this.toggle_git_diff(cx))),
+            ))
+    }
+
+    /// The standalone pane toolbar (kept for popped-out project windows, which
+    /// still stack it under their own title bar).
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex_none()
+            .h(rems(2.5))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_1()
+            .bg(cx.theme().title_bar)
+            // Click the toolbar chrome to deselect the active pane (so Ctrl+P and
+            // other muxel shortcuts go to muxel instead of the focused terminal).
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _e: &MouseDownEvent, window, cx| this.deselect_pane(window, cx)),
             )
+            .child(self.toolbar_controls(cx))
     }
 
     /// The Ctrl+P search palette: a filter box + a results list (files in the
@@ -17010,21 +17050,17 @@ impl MuxelApp {
             )
     }
 
-    fn render_titlebar(&self, workspace_name: String, cx: &mut Context<Self>) -> impl IntoElement {
-        // The TitleBar registers the whole bar as a window-drag region (mouse-down
-        // then start_window_move on the next move). A button click with the
-        // slightest movement would start a window move and swallow the click — so
-        // wrap each button to stop mouse-down from reaching the bar's drag handler.
-        fn nodrag(el: impl IntoElement) -> Div {
-            div()
-                .flex()
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(el)
-        }
+    fn render_titlebar(
+        &self,
+        workspace_name: String,
+        sidebar_width: Option<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         // Intercept the title-bar X (which otherwise calls remove_window directly,
         // bypassing on_window_should_close) so quitting asks for confirmation —
         // or, with minimize-to-tray on, iconifies to the tray instead.
         TitleBar::new()
+            .h(rems(2.5))
             .on_close_window(cx.listener(|this, _ev, window, cx| {
                 if this.minimize_to_tray_active() {
                     window.minimize_window();
@@ -17036,80 +17072,108 @@ impl MuxelApp {
             .child(
                 div()
                     .w_full()
-                    .px_2()
+                    .h_full()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .child(nodrag(
-                        Button::new("toggle-sidebar")
-                            .ghost()
-                            .icon(IconName::PanelLeft)
-                            .tooltip(t("Toggle sidebar"))
-                            .on_click(
-                                cx.listener(|this, _ev, window, cx| {
-                                    this.toggle_sidebar(window, cx)
-                                }),
-                            ),
-                    ))
-                    .child(div().font_semibold().child(t("muxel")))
+                    // Click the bar chrome to deselect the active pane (so Ctrl+P
+                    // and other muxel shortcuts go to muxel, not the terminal).
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _e: &MouseDownEvent, window, cx| {
+                            this.deselect_pane(window, cx)
+                        }),
+                    )
+                    // Branding segment sized to the sidebar panel so the pane
+                    // controls begin exactly at the sidebar/main divider instead
+                    // of being crammed against the window's left edge.
+                    .child({
+                        let mut branding = div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .pl_2()
+                            .h_full()
+                            .min_w_0();
+                        if let Some(w) = sidebar_width {
+                            branding = branding.w(w).flex_shrink_0().overflow_hidden();
+                        }
+                        branding
+                            .child(nodrag(
+                                Button::new("toggle-sidebar")
+                                    .ghost()
+                                    .icon(IconName::PanelLeft)
+                                    .tooltip(t("Toggle sidebar"))
+                                    .on_click(cx.listener(|this, _ev, window, cx| {
+                                        this.toggle_sidebar(window, cx)
+                                    })),
+                            ))
+                            .child(div().font_semibold().child(t("muxel")))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(workspace_name),
+                            )
+                    })
+                    .child(self.toolbar_controls(cx))
+                    .child(div().flex_1())
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(workspace_name),
-                    )
-                    .child(div().flex_1())
-                    .child(nodrag(
-                        Button::new("global-search")
-                            .ghost()
-                            .small()
-                            .icon(IconName::Search)
-                            .label(t("Search…"))
-                            .tooltip(t("Search files and terminals (Ctrl+P)"))
-                            .on_click(cx.listener(|this, _ev, window, cx| {
-                                this.open_search_palette(window, cx)
-                            })),
-                    ))
-                    .child(div().flex_1())
-                    .child(nodrag(
-                        Button::new("workspaces")
-                            .ghost()
-                            .icon(IconName::CircleUser)
-                            .tooltip(t("Switch workspace"))
-                            .on_click(cx.listener(|this, _ev, _window, cx| {
-                                this.open_workspace_selector(cx)
-                            })),
-                    ))
-                    .child(nodrag(
-                        Button::new("dashboard")
-                            .ghost()
-                            .icon(IconName::LayoutDashboard)
-                            .selected(self.show_dashboard)
-                            .tooltip(t("Dashboard"))
-                            .on_click(
-                                cx.listener(|this, _ev, _window, cx| this.toggle_dashboard(cx)),
-                            ),
-                    ))
-                    .child(nodrag(
-                        Button::new("settings")
-                            .ghost()
-                            .icon(IconName::Settings)
-                            .selected(self.show_settings)
-                            .tooltip(t("Settings"))
-                            .on_click(cx.listener(|this, _ev, window, cx| {
-                                this.toggle_settings(window, cx)
-                            })),
-                    ))
-                    .child(nodrag(
-                        Button::new("notifications")
-                            .ghost()
-                            .icon(IconName::Bell)
-                            .selected(self.notifications_enabled)
-                            .tooltip(t("Notifications"))
-                            .on_click(
-                                cx.listener(|this, _ev, _window, cx| this.toggle_notifications(cx)),
-                            ),
-                    )),
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .pr_2()
+                            .child(nodrag(
+                                Button::new("global-search")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::Search)
+                                    .label(t("Search…"))
+                                    .tooltip(t("Search files and terminals (Ctrl+P)"))
+                                    .on_click(cx.listener(|this, _ev, window, cx| {
+                                        this.open_search_palette(window, cx)
+                                    })),
+                            ))
+                            .child(nodrag(
+                                Button::new("workspaces")
+                                    .ghost()
+                                    .icon(IconName::CircleUser)
+                                    .tooltip(t("Switch workspace"))
+                                    .on_click(cx.listener(|this, _ev, _window, cx| {
+                                        this.open_workspace_selector(cx)
+                                    })),
+                            ))
+                            .child(nodrag(
+                                Button::new("dashboard")
+                                    .ghost()
+                                    .icon(IconName::LayoutDashboard)
+                                    .selected(self.show_dashboard)
+                                    .tooltip(t("Dashboard"))
+                                    .on_click(cx.listener(|this, _ev, _window, cx| {
+                                        this.toggle_dashboard(cx)
+                                    })),
+                            ))
+                            .child(nodrag(
+                                Button::new("notifications")
+                                    .ghost()
+                                    .icon(IconName::Bell)
+                                    .selected(self.notifications_enabled)
+                                    .tooltip(t("Notifications"))
+                                    .on_click(cx.listener(|this, _ev, _window, cx| {
+                                        this.toggle_notifications(cx)
+                                    })),
+                            ))
+                            .child(nodrag(
+                                Button::new("settings")
+                                    .ghost()
+                                    .icon(IconName::Settings)
+                                    .selected(self.show_settings)
+                                    .tooltip(t("Settings"))
+                                    .on_click(cx.listener(|this, _ev, window, cx| {
+                                        this.toggle_settings(window, cx)
+                                    })),
+                            )),
+                    ),
             )
     }
 
@@ -18107,6 +18171,25 @@ impl MuxelApp {
         theme::set_ui_font_size(self.settings.ui_font_size, cx);
         self.persist_settings();
         cx.notify();
+    }
+
+    /// Adjust the per-pane tab/control strip height (px at base UI scale) and
+    /// save. Rendered in rems, so UI zoom still scales it with everything else.
+    fn adjust_tab_strip_height(&mut self, delta: f32, cx: &mut Context<Self>) {
+        self.settings.tab_strip_height = (self.settings.tab_strip_height + delta).clamp(22.0, 48.0);
+        self.persist_settings();
+        cx.notify();
+    }
+
+    /// Button/icon size class for the tab strip: grows in steps with the strip
+    /// height setting so the strip's controls scale up with the bar (classes
+    /// stay rem-based, so UI zoom keeps scaling them too).
+    fn strip_btn_size(&self) -> gpui_component::Size {
+        match self.settings.tab_strip_height {
+            h if h >= 42.0 => gpui_component::Size::Medium,
+            h if h >= 34.0 => gpui_component::Size::Small,
+            _ => gpui_component::Size::XSmall,
+        }
     }
 
     fn load_keybinding_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -19621,6 +19704,28 @@ impl MuxelApp {
                             .on_click(cx.listener(|this, _e, _w, cx| this.adjust_ui_font(1.0, cx))),
                     ),
             )
+            .child(self.settings_label(
+                &t("Tab strip height — the tab/control bar on every pane"),
+                cx,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Button::new("tab-strip-dec").ghost().label("−").on_click(
+                        cx.listener(|this, _e, _w, cx| this.adjust_tab_strip_height(-2.0, cx)),
+                    ))
+                    .child(
+                        div()
+                            .w(rems(4.0))
+                            .text_center()
+                            .child(format!("{}", self.settings.tab_strip_height.round() as i32)),
+                    )
+                    .child(Button::new("tab-strip-inc").ghost().label("+").on_click(
+                        cx.listener(|this, _e, _w, cx| this.adjust_tab_strip_height(2.0, cx)),
+                    )),
+            )
             .child(self.settings_label(&t("UI zoom — scales the whole app"), cx))
             .child(
                 div()
@@ -21071,7 +21176,6 @@ impl Render for MuxelApp {
             .min_w_0()
             .flex()
             .flex_col()
-            .child(self.render_toolbar(cx))
             .child(div().flex_1().min_h_0().child(main_content));
         // The file browser (second sidebar) nests its own resizable so its width
         // persists independently of the project sidebar.
@@ -21149,6 +21253,18 @@ impl Render for MuxelApp {
                 0.0
             };
         let body_minimum = center_minimum + if sidebar_hidden { 0.0 } else { 160.0 };
+        // Mirror the sidebar panel width so the merged title bar's branding
+        // segment ends exactly at the sidebar/main divider (None when hidden).
+        let sidebar_half = (f32::from(window.viewport_size().width) * 0.5).max(440.0);
+        let sidebar_width_px = if sidebar_hidden {
+            None
+        } else {
+            Some(px(self
+                .workspace
+                .sidebar_width
+                .unwrap_or(232.0)
+                .clamp(160.0, sidebar_half)))
+        };
         let body: AnyElement = if sidebar_hidden {
             center
         } else {
@@ -21243,7 +21359,7 @@ impl Render for MuxelApp {
             .text_color(cx.theme().foreground);
         let root = self.attach_workspace_actions(root, cx);
         let root = root
-            .child(self.render_titlebar(active_name, cx))
+            .child(self.render_titlebar(active_name, sidebar_width_px, cx))
             .child(div().flex_1().min_h_0().flex().child(outer))
             .children(
                 self.show_settings

@@ -4,12 +4,15 @@
 #
 #   scripts/install-desktop.sh            # build release + install
 #   scripts/install-desktop.sh --no-build # install using the existing binary
+#   MUXEL_EXEC=/path/to/muxel …           # point Exec at an installed binary
+#                                         # (implies --no-build; used by
+#                                         #  install.sh / promote.sh flows)
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-bin="$repo_root/target/release/muxel"
+bin="${MUXEL_EXEC:-$repo_root/target/release/muxel}"
 
-if [[ "${1:-}" != "--no-build" ]]; then
+if [[ "${1:-}" != "--no-build" && -z "${MUXEL_EXEC:-}" ]]; then
     echo "building release binary…" >&2
     (cd "$repo_root" && cargo build --release -p muxel)
 fi
