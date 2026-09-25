@@ -2,9 +2,30 @@
 //! extra args, a custom command). Byte-for-byte port of the iOS companion's
 //! `Shell.splitWords` (`ios/Muxel/Util/Shell.swift`) — the two must stay in
 //! lockstep (see the protocol-contract table in `ios/README.md`) — and the
-//! decoding inverse of [`crate::ssh::sh_quote`]-joined lines.
+//! decoding inverse of [`sh_quote`]-joined lines.
 
-use crate::ssh::sh_quote;
+/// Quote one word for a POSIX shell line: bare-safe words stay unquoted, anything
+/// else is single-quoted with `\'` escaping.
+pub fn sh_quote(s: &str) -> String {
+    let safe = !s.is_empty()
+        && !s.starts_with('=')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-+/:=@,%".contains(c));
+    if safe {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
 
 /// Split a command line into shell words. Space/tab/CR/LF separate (exactly
 /// those four — not all Unicode whitespace, matching Rust's behavior the iOS

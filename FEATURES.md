@@ -6,7 +6,7 @@ with first-class git worktrees, agent status tracking, and notifications.
 
 This file is the canonical catalogue of what muxel can do. **When a user-facing
 feature is added or changed, update the matching entry here in the same change**
-(see `CLAUDE.md`).
+(see `AGENTS.md`).
 
 ## Panes & layout
 
@@ -19,8 +19,8 @@ feature is added or changed, update the matching entry here in the same change**
   unusable (keeps a sane terminal width).
 - **Scrollable pane area** — because panes have that minimum width, a layout with
   enough panes side by side needs more width than a small display has — most often
-  a layout built on a large monitor and then reopened on a laptop, or pulled from a
-  remote host that had one. The pane area scrolls horizontally in that case, so the
+  a layout built on a large monitor and then reopened on a laptop. The pane area
+  scrolls horizontally in that case, so the
   panes that don't fit can still be reached instead of falling off the right edge.
   Panes still shrink to fill a window they do fit in; scrolling only begins once
   they can shrink no further. Drag its scrollbar, swipe a trackpad sideways, or
@@ -62,10 +62,10 @@ feature is added or changed, update the matching entry here in the same change**
   deliberately resuming the source. **Restart agent** (resume-capable agents only)
   does what the toolbar Restart does for that tab.
 - **Restart** — the toolbar Restart (also the tab menu's *Restart agent* and the
-  palette's *Restart agent*) stops the pane's process *and* its tmux session,
-  local or remote, then relaunches in place in a fresh session. A resume-capable
-  agent comes back on its saved conversation, so an updated harness binary takes
-  effect without losing it; a shell or other program starts over.
+  palette's *Restart agent*) stops the pane's process *and* its tmux session, then
+  relaunches in place in a fresh session. A resume-capable agent comes back on its
+  saved conversation, so a newer harness binary takes effect without losing it; a
+  shell or other program starts over.
 - **Tab cycling** — keyboard shortcuts cycle to the next/previous tab.
 
 ## Pop-out windows
@@ -82,19 +82,9 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **Built-in agent presets** — Shell, Claude, opencode, Amp (ampcode), Grok
   (x.ai), Hermes, Ollama, **Ollama Code**, Pi, and a **Browser** preset, each with
-  its own icon. On Windows the default shell is **PowerShell**, with **Cmd** and
-  **Git Bash** offered as additional presets (instead of the single "Shell"). A
-  preset is either a terminal agent or a **Browser** (opens a browser pane at its
-  homepage) — switch the type and edit the fields in Settings → Agents.
-- **Git Bash on Windows** — when Git for Windows is installed, a **Git Bash**
-  preset runs its `bash.exe` as an interactive login shell, so the pane gets the
-  MSYS tools (`ls`, `grep`, `ssh`, …) rather than a bare shell. muxel finds bash
-  by walking the standard install locations, the root of whichever `git.exe` is on
-  `PATH` (so a custom install directory works), and Scoop's app directory; set
-  `MUXEL_GIT_BASH` to point at a portable install. It never resolves a bare
-  `bash`, which on Windows is the WSL launcher rather than Git Bash. Panes open in
-  the project or worktree directory instead of jumping to your home directory, and
-  the preset is hidden when Git isn't installed.
+  its own icon. A preset is either a terminal agent or a **Browser** (opens a
+  browser pane at its homepage) — switch the type and edit the fields in
+  Settings → Agents.
 - **Ollama Code** — runs a coding agent backed by an Ollama model via
   `ollama launch <agent> --model <model>` (seeded as `ollama launch opencode
   --model glm-5.2:cloud`); change the agent or model in the preset's args.
@@ -127,100 +117,20 @@ feature is added or changed, update the matching entry here in the same change**
     panes can share a project without resuming one another's conversations.
   **Conversation switches stick** — an agent can swap its conversation inside a live
   pane (`/resume`, `/clear`, a fork) without restarting the PTY, and muxel rebinds the
-  pane to what's actually on screen instead of the conversation it launched. Local
+  pane to what's actually on screen instead of the conversation it launched.
   Claude panes learn the switch from a process-local `SessionStart` hook keyed to the
   pane; Codex panes learn it from a later OSC title. Both are accepted only after the
   new UUID's own on-disk session proves it belongs to this pane's directory and that no
   sibling pane already owns it — terminal titles carry no sender identity, so an
-  unverified one cannot rebind a pane. Remote Claude panes keep their starter binding.
-  If the saved session is gone, the pane quietly starts fresh.
+  unverified one cannot rebind a pane. If the saved session is gone, the pane
+  quietly starts fresh.
 - **Broadcast** — `Ctrl+Shift+I` opens a broadcast bar; type a line and Enter (or
   Send) writes it + a newline to every agent pane in the active project at once.
-- **Speech-to-text dictation** — a toolbar mic button (or `Ctrl+Shift+M` to
-  toggle, or hold `Ctrl+Shift+H` to push-to-talk) records the microphone and
-  types the transcript into the **focused** agent's prompt, left unsubmitted so
-  you can review before pressing Enter (or enable auto-submit). Two engines,
-  chosen in Settings → Speech: **Local** runs whisper.cpp entirely on your
-  machine (the model downloads once on first use), or a **Provider** — any
-  OpenAI-compatible `/audio/transcriptions` endpoint (OpenAI, Groq, a self-hosted
-  server) via a base URL + model + API key stored in the OS keychain. Provider
-  mode uploads your recorded audio to that endpoint; local mode never leaves the
-  machine. macOS asks for microphone permission on first use. If the mic can't be
-  used you're told as soon as you press the button, rather than after speaking: no
-  input device says so plainly, and a *blocked* mic (which macOS otherwise reports
-  only as silence) comes with an **Open Settings** button that opens the OS
-  microphone privacy screen. (Local whisper isn't
-  available on Windows-on-ARM — whisper.cpp can't build there — so use a Provider;
-  every other platform has both.)
-- **Spoken wake command** — an opt-in toggle in Settings → Speech: say the wake
-  phrase (default *"wake up daddy's home"*) into the mic and muxel walks every
-  agent pane of every project in turn, relaunching each one whose process isn't
-  running, then lands back on the pane you started from. Nothing is drawn over the
-  workspace — the sweep moves through the real panes, so you watch them come back.
-  Panes still running are left untouched, and the transcript that triggers it is
-  treated as a command: it isn't typed into any agent. Matching ignores case,
-  punctuation and surrounding filler, so however whisper hears it ("Wake up,
-  Daddy's home!") it fires; the phrase itself is editable. A project shown in a
-  second window keeps its own focus — its dead panes are relaunched without
-  stealing it. The result lands in the notifications feed either way.
-- **Spoken report** (optional) — with the wake command on, a second toggle has muxel
-  greet you with what it found ("Good evening. Two agents are offline. Bringing
-  them back online.") and sign off when the sweep finishes ("All systems online.
-  Standing by."). The greeting is timed to land before the panes start moving. Turn
-  it off and the wake command runs silently.
-- **Read aloud (accessibility)** — a speaker button in the toolbar (or
-  `Ctrl+Shift+R`, or *Read the last reply aloud* in the `Ctrl+P` palette) reads the
-  **focused** agent's last reply out loud. It reads only the model's own words — its final message (usually the summary of what it did) by
-  default, or the whole last turn — and **never code**: fenced blocks, diffs,
-  commands, tool calls and their output are skipped, and markdown, emoji and
-  symbols are flattened so nothing is read out as punctuation. For a local Claude
-  pane the reply comes from Claude's own session transcript, so it's exact even
-  after it has scrolled off screen; for other agents (Codex, Gemini, …) muxel finds
-  it in the terminal's scrollback, or in tmux's history for a tmux pane. When
-  there's nothing to read, it says so out loud, so the button is usable without
-  looking at the screen.
-- **Pause, resume and start over, per pane** — every agent pane has its own
-  read-aloud controls in its header (and the toolbar's act on the focused pane):
-  the speaker reads, then becomes **pause** / **resume**, with **start over** and
-  **stop** beside it. Each pane keeps its own place: reading another pane pauses the
-  one speaking, which resumes where it left off — at the start of the sentence it
-  paused in — whenever you come back to it. A tab being read shows a speaker (or
-  pause) badge that pauses or resumes it without switching to it. `Ctrl+Shift+R`
-  reads / pauses / resumes the focused pane, `Ctrl+Alt+R` starts it over, and
-  `Ctrl+Alt+S` stops whatever is speaking; all three are in the `Ctrl+P` palette.
-- **Read Aloud settings** — Settings → Read Aloud: show or hide the read-aloud buttons;
-  final message vs. whole turn; **auto-read** when the focused pane's agent (or any
-  agent) finishes, queued one reply at a time (shells are never auto-read); say the
-  agent's name first; a length limit (about 30 s / 1 min / 3 min) that stops at the
-  end of a sentence; say "link" instead of spelling out URLs; say only a path's file
-  name; read tables row by row or skip them; and the voice itself (below).
-- **The voice** — Settings → Read Aloud picks the synthesizer, in the same three
-  flavours as dictation:
-  - **System** (default) — the voice the OS already ships (`say` on macOS, SAPI on
-    Windows, `spd-say`/`espeak` on Linux). No model, no key, no network, works on a
-    fresh install. Pick any installed voice from a list of those in your UI language
-    (macOS and Windows; on Linux, type its name).
-  - **Local** — **Kokoro-82M**, a neural voice run on your machine, with six
-    English reads to pick from. The model downloads once (~89 MB) the first time it
-    speaks and nothing leaves the machine after that. Speech is streamed a sentence
-    at a time, so it starts talking in about a second. Only in builds made with the
-    `voice-local` cargo feature.
-  - **Provider** — any OpenAI-compatible `/audio/speech` endpoint, reusing the base
-    URL and keychain API key the Speech section already stores; the voice and model
-    (e.g. `onyx` / `tts-1`) are yours to set. What it reads is sent to that endpoint.
-
-  A **speaking rate** control (0.5×–2×) applies to the System and Provider voices,
-  and a **Test voice** button speaks a sample line. Every engine degrades rather than
-  fails: a provider that errors, a model that won't download, or a machine with no
-  audio device at all falls back to the system voice, and failing even that, stays
-  quiet. (The local voice, like local whisper, is unavailable on Windows-on-ARM; use a
-  Provider there.)
 - **Shared project memory** — opt-in per project: agents are told (via their system
   prompt) to `grep` and add durable lessons to a `.muxel/MEMORY.md` file shared
   across every agent and run in that project. muxel creates the file, git-ignores
-  `.muxel/`, and works for local and remote SSH projects (the file lives in the
-  project's working dir on whichever host). Local agents also get its path in a
-  `MUXEL_MEMORY_FILE` env var. Enable it on a project (sidebar right-click or
+  `.muxel/`, and agents get its path in a `MUXEL_MEMORY_FILE` env var. Enable it
+  on a project (sidebar right-click or
   Settings → Projects); a memory button on the project row opens the manager. Plain
   shells are skipped.
 - **Self-maintaining memory** — each fact is one `##` section carrying a machine
@@ -234,8 +144,7 @@ feature is added or changed, update the matching entry here in the same change**
   second-sidebar panel (like the file browser, sharing its slot; width persists per
   workspace): search/grep the entries, add one (title + note + tags), pin/unpin
   (pinned entries are exempt from purge and cap), delete (with confirm), or open the
-  raw `MEMORY.md` in the editor. Entries load and persist over SSH for remote
-  projects too.
+  raw `MEMORY.md` in the editor.
 
 ## Agent status
 
@@ -257,10 +166,10 @@ feature is added or changed, update the matching entry here in the same change**
   visible foreground progress row also preserves **working** when a narrow tmux
   pane truncates the usual interrupt marker. Brief
   Grok redraw gaps do not forge completion. Ambiguous waiting rows do not claim
-  active work. Local Codex `/rename` values are read
+  active work. Codex `/rename` values are read
   from its session index by the pane's captured session UUID, so child commands
   such as `npm` cannot replace the session name or forge a title-derived state
-  transition. Remote Codex panes retain the provider's structural title fallback.
+  transition.
 - **Per-agent detection markers** — status is inferred from on-screen TUI markers
   (e.g. Claude's "esc to interrupt" spinner, a permission prompt), with built-in
   defaults per agent and **editable working/blocked markers per preset**.
@@ -362,17 +271,15 @@ feature is added or changed, update the matching entry here in the same change**
 
 - **System webview, not bundled Chromium** — preview links agents print (or a
   locally hosted dev site) without leaving muxel. Uses the OS engine (WKWebView on
-  macOS, WebView2 on Windows, WebKitGTK on Linux), so it's light on disk and memory.
-- **macOS/Windows: an embedded pane** — ctrl+click a URL and it opens as a browser
-  pane beside the terminal, with an address bar and Back / Forward / Reload buttons;
+  macOS, WebKitGTK on Linux), so it's light on disk and memory.
+- **macOS: an embedded pane** — ctrl+click a URL and it opens as a browser pane
+  beside the terminal, with an address bar and Back / Forward / Reload buttons;
   Reload refreshes the page you are actually on (several links deep, if that's where
   you are), not the pane's original URL. The URL persists and restores with the
   workspace. Clicking into the page makes it the active pane — so paste and the
   toolbar act on the browser, not on whichever pane you were in before — and hands
   it the keyboard; muxel's own shortcuts keep working until you click into a page.
-  The toolbar can open the current page in the system browser. Native page context
-  menus remain usable, and WebView2 stores its profile under muxel's app-data
-  directory rather than beside the executable.
+  The toolbar can open the current page in the system browser. Native page context menus remain usable.
 - **Linux: a separate browser window** — gpui can't embed WebKitGTK, so links open
   in a muxel-managed browser window (a crash-isolated `muxel --browser` process);
   if WebKit isn't installed it falls back to the system browser with a note.
@@ -380,8 +287,8 @@ feature is added or changed, update the matching entry here in the same change**
   pane; pick it anywhere you pick an agent (the toolbar's new-pane dropdown, or
   hold a pane's split / `+` button and choose it). Configure its homepage — and
   add more browser presets with their own homepages — in **Settings → Agents**
-  (default `duckduckgo.com`; a bare domain gets `https://`). On macOS/Windows it's
-  an embedded pane in the layout; on Linux it opens in a separate browser window.
+  (default `duckduckgo.com`; a bare domain gets `https://`). On macOS it's an
+  embedded pane in the layout; on Linux it opens in a separate browser window.
 - **Optional** — Settings → Behavior → "Open ctrl+clicked links in the built-in
   browser" (default on); off routes every link to the system browser.
 
@@ -393,7 +300,7 @@ feature is added or changed, update the matching entry here in the same change**
   still records it). Clicking the notification raises muxel and jumps to the pane
   that fired it.
 - **In-app NOTIFICATIONS sidebar** — a category above PROJECTS collecting agent
-  events **and** all app messages (git results, SSH connections, and save errors —
+  events **and** all app messages (git results and save errors —
   workspace, settings, workspace list, project memory, and layout backups —
   everything that used to be a pop-up toast goes here instead; persistent save
   failures report once per cause, not on every autosave). Agent rows are
@@ -405,81 +312,14 @@ feature is added or changed, update the matching entry here in the same change**
   menu lists every agent with its live status and the most recent notifications;
   clicking one restores muxel and focuses that project + pane, and "Quit" exits for
   real. Linux uses StatusNotifierItem (needs an AppIndicator/SNI host — standard on
-  KDE, the AppIndicator extension on GNOME); Windows/macOS use the notification-area
-  / status-bar item. (Stock GPUI can only iconify, so the window still appears in the
+  KDE, the AppIndicator extension on GNOME); macOS uses the status-bar item. (Stock
+  GPUI can only iconify, so the window still appears in the
   taskbar; restoring from the tray is best-effort on Wayland — the dash always works.)
 - **Developer console** (Settings → Behavior → "Developer console", toggled with F12) —
   an opt-in popped-out window logging errors as they happen. A failed agent launch
-  shows the program it tried, the working directory, and the OS error/code; git, save,
-  and SSH errors land here too. Timestamped, newest first, selectable/copyable, with a
+  shows the program it tried, the working directory, and the OS error/code; git and
+  save errors land here too. Timestamped, newest first, selectable/copyable, with a
   Clear button. F12 is a no-op until the setting is enabled.
-
-## Outside control (`muxel ctl`)
-
-- **Let another agent drive muxel** — Settings → Grok Bot → "Allow outside tools
-  to control muxel" (off by default) lets a program on the same computer — an
-  orchestrating agent such as xAI's Grok Bot, a script, another coding agent — work
-  the agents running in muxel through the `muxel ctl` command: list projects, the
-  pane layout and every agent (program, model, worktree, focus), see each one's
-  status (working / blocked / done / idle / exited), read its last prompt and last
-  reply, send it a prompt, answer the question it is blocked on, and press keys.
-  Every command prints JSON.
-- **Reads what the agent actually said** — `show` returns the last prompt and the
-  model's last reply the way read-aloud finds them (a local Claude pane's session
-  transcript, otherwise the pane's scrollback or tmux history), and for a blocked
-  agent the question with its numbered options read off the screen. `wait` blocks
-  until the agent's turn ends — it finishes, asks something, or exits — then
-  returns the same, so a caller can `send` then `wait` without polling. An answer
-  to a question counts as a turn too, so `answer` then `wait` works the same way.
-- **Refuses what would go wrong** — `send` won't type into an agent that is
-  working or waiting on a question (unless forced), `answer` only picks an option
-  the prompt actually offers, and a pane that isn't running says so rather than
-  swallowing the input. Shell panes are off limits unless "Also allow typing into
-  shell panes" is on too, since typing into a shell is running commands.
-- **Local and owner-only** — the running app listens on a random loopback port and
-  writes it, with a fresh random token, to `control.json` in muxel's data directory,
-  readable only by the user; nothing is reachable from the network, and a request
-  without the token is refused. Turning the setting off (or quitting) closes it.
-- **Settings → Grok Bot** — a setup page that walks through connecting Grok Bot
-  in four steps: turn on outside control (with a live status: on and listening,
-  starting, or off), allow command execution on this computer in Grok Bot's own
-  settings (where to find it), copy the skill (with a preview of exactly what gets
-  pasted), and **Test**, which runs the same `muxel ctl` command Grok Bot will and
-  shows what muxel answered — or why it couldn't. It also shows this computer's
-  muxel command, with a copy button, and links to Grok Bot's documentation.
-- **Instructions for the other agent** — `muxel ctl skill` (or Settings → Grok Bot
-  → "Copy skill") produces a ready-made skill: the commands, what each status
-  means, and the rules — one prompt at a time, `wait` after `send`, and permission
-  prompts left to the user unless they've said otherwise. Paste it into Grok Bot
-  (whose "Execution on Local Computer" setting must allow it to run commands here)
-  or any agent that can run shell commands.
-- **Works across several computers** — one skill serves every computer the agent
-  works on: it names the muxel binary it was copied from, and otherwise says how to
-  find muxel there (the running app records its own path in `control.json`, whose
-  location it gives for macOS, Linux and Windows, then the usual install places and
-  the `PATH`). Every reply carries `host`, the computer whose muxel answered, so an
-  agent working with several computers can tell which one it reached.
-- **However muxel was installed on Linux** — `muxel ctl` works from the .deb or
-  .rpm (`/usr/bin/muxel`), the tarball or install script, and the AppImage, which
-  is run with `ctl` like any command (`muxel-linux-x86_64.AppImage ctl panes`); a
-  running AppImage records the `.AppImage` file, not its temporary mount, as its
-  path. It needs no display, so it runs from an agent's background shell. The skill
-  covers the usual snags: an AppImage without FUSE (`APPIMAGE_EXTRACT_AND_RUN=1`), a
-  caller's `LD_LIBRARY_PATH` that doesn't suit muxel (`env -u LD_LIBRARY_PATH`),
-  and a caller whose home or `XDG_DATA_HOME` differs from muxel's (`MUXEL_CONTROL=`
-  pointing at its `control.json`). CI checks that `muxel ctl` starts from each
-  release package.
-- **Shared agents take turns** — an agent can be reached from more than one muxel:
-  a remote project opened on several computers, or a local tmux project another
-  computer attached to. Before typing, muxel checks a marker on the agent's tmux
-  session — which every muxel attached to it reads — and refuses while another
-  muxel's turn with it is still open ("muxel on *host* is using this agent"),
-  then marks it as its own. Two muxels that reach an idle agent at the same moment
-  settle it between them: only one types. A marker left by a muxel that quit or
-  crashed lapses once the agent is seen to finish, or when its grace period runs
-  out. `show` reports it as `controller`: which computer last typed into the agent
-  this way, whether that was this muxel, and whether its turn is still open.
-  `send --force` overrides it.
 
 ## Terminal
 
@@ -492,7 +332,6 @@ feature is added or changed, update the matching entry here in the same change**
   immediately; right-click pastes). **Paste**: plain `Ctrl+V` is host-side smart
   paste — text and file paths go into the PTY; an image is forwarded as raw
   Ctrl+V (`0x16`) so agents that read the OS clipboard (Grok) can attach it.
-  Claude Code on Windows uses `Alt+V` (sent as `ESC v`) for images.
   `Shift+Insert` pastes and `Ctrl+Insert` copies. File **drag-and-drop** pastes
   shell-quoted paths into the focused terminal.
 - **Mouse reporting** — when an app enables mouse mode (Grok, Claude, vim, …),
@@ -511,7 +350,7 @@ feature is added or changed, update the matching entry here in the same change**
 - **Clickable links** — `Ctrl`/`Cmd`+click opens what's under the cursor: an
   `http(s)` URL, an OSC 8 hyperlink (e.g. `ls --hyperlink` or agent markdown
   links), a literal Markdown inline link, a `file://` URI, or a **file path**
-  (Windows/Unix absolute, `~/`, or relative to the pane's working directory).
+  (absolute, `~/`, or relative to the pane's working directory).
   Local files open in a muxel editor pane; only paths that exist are
   clickable, and a trailing `:line:col` is understood. `Ctrl`/`Cmd`+hover
   underlines the link and shows a pointing-hand cursor (Ctrl/Cmd down re-hit-tests
@@ -522,9 +361,9 @@ feature is added or changed, update the matching entry here in the same change**
   terminal link opens link actions instead of copying or pasting through the PTY.
 - **Focus reporting** — forwards focus in/out to the PTY (DECSET 1004) so agents
   know when their pane is active.
-- **OSC-52 clipboard** — programs in the terminal (including over SSH/tmux) can
+- **OSC-52 clipboard** — programs in the terminal (tmux-backed panes included) can
   copy to the system clipboard via `OSC 52`; clipboard *reads* are answered with
-  an empty reply, so a remote can probe for support but never see your clipboard.
+  an empty reply, so a program can probe for support but never see your clipboard.
 - **Color queries** — answers `OSC 10/11/12` and `OSC 4` color queries from the
   active theme's terminal palette, so TUIs detect dark/light mode correctly (and
   the answer always matches what's painted). Replies are generated directly on
@@ -574,8 +413,7 @@ feature is added or changed, update the matching entry here in the same change**
   hasn't been told about, `A` staged, `M` modified, `D` deleted, `!` conflicted.
   Folders carry the strongest status beneath them, so a collapsed folder still shows
   that something inside is unadded. Right-click anything with something to stage for
-  **Add to git** (a folder stages everything under it) — works on remote projects
-  too, where the `git add` runs on the host.
+  **Add to git** (a folder stages everything under it).
 - **Markdown & image rendering** — `.md`/`.markdown` files render as formatted
   markdown and image files (`png`, `jpg`, `gif`, `webp`, `bmp`, `svg`, …) render as
   images, both by default, with a header **Raw / Rendered** toggle to view the
@@ -617,7 +455,7 @@ feature is added or changed, update the matching entry here in the same change**
     files (same rows + diff windows). Per worktree: **Merge into…** any branch
     (checks it out + merges, then offers to remove the worktree), and **Delete** the
     worktree + its branch (enabled only when no instance is loaded in it).
-  Works for local and remote (SSH) projects; panel width persists per workspace.
+  Panel width persists per workspace.
 - **Git diff pane** — a simpler read-only pane showing the working-tree diff for a
   directory; opens as a **new tab** in the pane it's diffing (from a pane's "View
   changes", the project menu, or a worktree) rather than splitting off a new pane.
@@ -628,9 +466,8 @@ feature is added or changed, update the matching entry here in the same change**
 ## Sidebar & projects
 
 - **Empty-workspace onboarding** — a fresh workspace shows a centered get-started
-  screen (the muxel mark, an **Add a project** folder picker, a **New remote
-  project (SSH)** shortcut into the wizard, and the keyboard-shortcuts chord) in
-  the work area until the first project is added.
+  screen (the muxel mark, an **Add a project** folder picker, and the
+  keyboard-shortcuts chord) in the work area until the first project is added.
 - **Project list** — projects with live per-agent status rows; collapse a project.
 - **Branch label** — each project row shows its git repo's current branch with a
   branch icon (refreshed live).
@@ -677,145 +514,10 @@ feature is added or changed, update the matching entry here in the same change**
 - **No auto-created project** — start empty; add projects via a folder picker.
 - **No duplicate projects** — opening a folder that's already a project in this
   workspace is refused with an “already open” error instead of adding a second
-  copy. The same goes for remote projects (same host + directory): the
-  new-remote-project wizard stays open and says so inline. Symlinked or
-  trailing-slash spellings of the same path count as the same project, and on
-  Windows hosts so do differences in case or separator.
+  copy. Symlinked or trailing-slash spellings of the same path count as the same
+  project.
 - **Startup agents** — save the project's open agents as a startup set (preset +
   worktree flag) and relaunch them in one click from the project menu.
-
-## Remote development (SSH)
-
-- **Remote projects** — create a project that lives on a remote host over SSH
-  (the project list's network button → pick a host, enter the remote directory,
-  optionally verify it). Shells and agents then run on the remote, in a pane that
-  behaves exactly like a local one. Local muxel still owns the UI, layout, and
-  settings.
-- **Running agents are picked back up** — opening a remote project looks for muxel
-  tmux sessions still alive on the host in that project's tree, and re-attaches a
-  pane to any the workspace no longer has an instance for. An agent whose workspace
-  was lost keeps running on the host with nothing pointing at it; this brings it
-  back mid-conversation, exactly where it was, rather than starting a second one
-  beside it. It adopts only muxel's own sessions, only within the project, and never
-  one a pane already owns or one you deliberately closed — your own tmux is left
-  alone.
-- **Closing a remote agent really stops it** — closing a remote pane kills its tmux
-  session on the host, and muxel *confirms* the session is gone rather than assuming
-  the kill landed. A kill that fails (a blip, a control socket that went down with
-  the pane's own ssh, a host that is briefly unreachable) is retried over the
-  following half-minute, and anything still unfinished is finished on the next
-  connect to that host — aimed at the session's real name, even if the host has been
-  renamed since. Until it is confirmed dead, the close is remembered, so a session
-  whose kill is still in flight is never adopted back into a pane: a closed agent
-  stays closed across a muxel restart. Unconfirmed closes are listed in the
-  developer log.
-- **Remote Windows hosts** — a saved host can be marked **Windows**, and muxel then
-  speaks PowerShell to it instead of `sh`: panes, the file browser, editor saves,
-  layout sync, the memory file, project scan, remote git, and the connection test
-  all work the same as on a Linux host. Every command muxel sends is encoded so it
-  reads identically whether the host's OpenSSH `DefaultShell` is `cmd.exe` (the
-  Windows default) or PowerShell — there is nothing to configure on the far side
-  beyond enabling the SSH server. Interactive panes run PowerShell, pwsh 7+, or
-  `cmd.exe`, chosen per host, and load your profile so agents installed by npm or
-  winget are on `PATH`.
-  The one real difference: Windows has no tmux, so a pane there lasts as long as
-  its SSH connection rather than outliving it. On reconnect muxel relaunches the
-  pane and the agent resumes its saved conversation, so the thread survives even
-  though the process does not — and the tmux options are hidden for Windows hosts
-  rather than offered and quietly ignored.
-- **Scan for remote projects** — in the new-remote-project wizard, "Scan for
-  projects" searches the host for existing muxel projects (`.muxel/workspace.json`
-  markers, heavy dirs pruned) and lists the found roots; clicking one fills in the
-  directory and name so you can open it without typing the path. Mirrors the iOS
-  companion app's host scan.
-- **SSH host library** — Settings → Remotes manages saved hosts with the common
-  options: hostname/alias, port, user, auth (ssh-agent, key file, or password),
-  ProxyJump, agent forwarding, host-key policy, keepalive, compression (for slow
-  or high-latency links), and extra `-o` options. Two safe defaults are applied
-  automatically: a `ConnectTimeout` so an unreachable host fails promptly instead
-  of hanging a pane, and `IdentitiesOnly` when an explicit key file is set (so ssh
-  doesn't offer every agent key first and trip the server's `MaxAuthTries`) — both
-  overridable via a matching extra `-o`. A "Test connection" button verifies a host.
-- **Changed host key dialog** — when a host's key no longer matches `known_hosts`
-  (a reinstalled server — or a man-in-the-middle), connection tests, project
-  connects, and remote git operations raise an actionable dialog instead of a raw
-  OpenSSH error: the stored and newly presented `SHA256:` fingerprints side by
-  side (mirroring the iOS companion's prompt) with a destructive **Trust new
-  key** button that removes the stale entry via `ssh-keygen -R` (hashed entries
-  and `[host]:port` forms included) and retries — the reconnect then re-pins the
-  new key through ssh's `accept-new`. Cancel keeps refusing. Host-key state lives
-  entirely in OpenSSH's `known_hosts`; muxel keeps no key store of its own.
-- **Login identities** — Settings → Identities defines reusable logins (a name +
-  user + auth + key file or keychain password). A host can reference an identity
-  instead of entering credentials inline, so one login is defined once and shared by
-  many hosts (and rotated in one place). Selecting an identity on a host hides its
-  inline credential fields; the password is stored once in the keychain under the
-  identity and reused across every host that references it. Deleting an identity
-  falls its hosts back to inline/ssh-agent.
-- **Secure passwords** — saved SSH passwords are stored in the OS keychain (Secret
-  Service / macOS Keychain / Windows Credential Manager), never in muxel's config,
-  and fed to ssh via `sshpass`. Password auth requires `sshpass` (Linux/macOS only;
-  the panel warns when it's missing) — Windows uses key-file or ssh-agent auth,
-  which work everywhere.
-- **Resilient sessions** — remote panes default to a persistent tmux session on
-  the host, so a dropped connection is survivable: reconnecting re-attaches the
-  still-running agent. One multiplexed SSH connection per host is shared by all of
-  that host's projects, their panes and git calls: projects opening together (a
-  workspace, launch) wait for the first to connect instead of each opening its own,
-  and "Connected to …" is shown once per host rather than once per project.
-  Launching a tmux session (remote, or a local tmux-mode project) enables tmux
-  `mouse on`, so the pane's scroll wheel scrolls tmux's own copy-mode history
-  instead of just the visible screen.
-- **Survives a dropped connection** — every SSH connection keeps itself alive with
-  periodic probes (`ServerAliveInterval`), so a drop (Wi-Fi blip, laptop sleep, host
-  reboot) is *detected* — roughly a minute of silence — instead of the pane freezing
-  on a dead socket forever. A dropped remote tmux pane then shows **"Connection lost —
-  reconnecting…"** (not "exited"), because its session is still running on the host,
-  and muxel keeps retrying on its own — backing off to one attempt every 30s, for as
-  long as the outage lasts — until the host is reachable and reattaches the agent
-  right where it left off. Resuming a laptop whose Wi-Fi isn't up yet just costs a
-  retry or two. (Tune or disable the probe per host in Settings → Remotes →
-  Keepalive; blank uses a 20s default, `0` turns it off.)
-- **Reattaches everything on launch** — on startup muxel reconnects the tmux panes of
-  *every* remote project in the background, not just the one you had open, so agents
-  left running on your hosts come back automatically. Hosts that would need a password
-  you haven't saved are skipped (no password storm) and reconnect when you open them.
-- **Roaming layouts** — a remote project's pane layout is mirrored to the host at
-  `<remote_root>/.muxel/workspace.json`, so opening the same project from another
-  machine restores the whole session (the tmux-backed panes re-attach to their
-  still-running agents). muxel pushes the layout as you rearrange panes and, on
-  connect, loads whichever copy — local or remote — is newer; the replaced copy is
-  kept as a one-level backup on each side. Automatic for every remote project; no
-  setup required. **Changes sync live**: while connected, each side re-reads the
-  shared file every few seconds and applies a peer's changes in place — panes a peer
-  adds appear, attached to their running tmux sessions; panes it closes go away;
-  renames carry over — without restarting any pane both sides share. Only real
-  layout changes are pushed: a pane's size and agent status are per-machine and never
-  trigger one. A failing push is reported once (not on every retry) and retried in
-  the background.
-- **Shareable local projects** — a *local* project also mirrors its layout to
-  `<root>/.muxel/workspace.json` (and git-ignores `.muxel/`) when tmux mode is on,
-  so its panes are tmux sessions a peer can attach to. The iOS companion app can
-  then SSH into the machine, read that file, and bring up / drive the same panes —
-  the desktop didn't need to be opened as a "remote" project. The shared
-  `tmux_session` name keeps a pane addressing the same session from either side.
-  Panes a peer creates over SSH — the iOS app, or muxel on another machine that
-  opened this one as a remote project — show up in the local window within a few
-  seconds, attached to the peer's tmux session (found by the pane id at the end of
-  the session name when the peer didn't record one).
-- **Reconnect on failure** — when a remote project's SSH connection fails (or
-  drops), the pane area shows the error with **Reconnect** (re-runs the connect
-  pre-flight, re-syncs the layout, respawns panes) and **Scan for projects**
-  (opens the wizard preset to that host and scans it) buttons; both are also in
-  the project's right-click menu, so a live-but-flaky connection can be retried
-  without reselecting the project.
-- **Remote git** — the branch label and the project git menu (switch/new branch,
-  commit, pull, push, fetch, stash) operate on the remote repo over the shared
-  connection; remote status is polled off the UI thread.
-- **Remote files** — the file browser lists a remote project's files over SSH
-  (gitignore-aware via `git ls-files`, else `find`); opening a file reads it over
-  SSH into the editor and Ctrl+S writes it back. Open-in-terminal opens a remote
-  shell in that directory.
 
 ## Workspaces & persistence
 
@@ -832,9 +534,8 @@ feature is added or changed, update the matching entry here in the same change**
 
 ## Settings & theming
 
-- **Settings modal** — sections for Appearance, Editor, Behavior, Speech, Read
-  Aloud, Agents, Runners, Snippets, Loops, Remotes, Identities, Projects, and
-  Keybindings.
+- **Settings modal** — sections for Appearance, Editor, Behavior, Agents,
+  Runners, Snippets, Loops, Projects, and Keybindings.
 - **Themes** — ~22 bundled themes with a switcher (Catppuccin, Gruvbox, Tokyo
   Night, Solarized, Ayu, Everforest, and more).
 - **Sizing** — whole-app zoom plus independent UI, terminal, and code/diff font
@@ -853,30 +554,25 @@ feature is added or changed, update the matching entry here in the same change**
   its prompt with no foreground command and no other tabs — since closing it
   loses nothing.
 - **Local tmux by default** — "New agents run in a tmux session" defaults **on**
-  whenever `tmux` is installed, so local panes survive a muxel restart and reattach
-  (matching remote panes); the toggle greys out and has no effect when tmux isn't
-  found. tmux is unix-only, so this never applies on Windows.
+  whenever `tmux` is installed, so panes survive a muxel restart and reattach; the
+  toggle greys out and has no effect when tmux isn't found.
 - **Agents survive a stray `pkill`** — muxel starts the tmux server itself, from a
   command line naming no project, so an agent running `pkill -f <project>` (to clear
   its own dev server) can't match the *shared* server and kill every session with it.
   Such a `pkill` reaches only that pane's tmux client: the session and the agent keep
   running, and muxel **reattaches the pane automatically** — you see it blink, not die.
-  Local and remote alike (SSH panes and the iOS companion do the same), since a host
-  has one tmux server shared by every session on it.
+  A host has one tmux server shared by every session on it.
 - **Killed tmux sessions come back** — if the tmux session (or the whole server) dies
   anyway, the pane doesn't tombstone: muxel recreates the session and relaunches the
   agent with `--resume`, so a resume-capable agent picks its conversation back up where
   it left off (tmux scrollback is the only casualty). A deliberate `tmux kill-session`,
   and an agent simply quitting, still close the pane normally. The feed says which
   happened — *reattached* (session survived) or *session restored* (agent resumed).
-- **tmux lifecycle** — closing a **pane** always kills its tmux session (local or
-  remote); a *dropped* SSH connection never auto-closes — it leaves a tombstone
-  pane, keeping the remote session reconnectable. Quitting the **app** leaves
-  sessions alive by design (they reattach next launch): when any exist, the quit
-  dialog offers two checkboxes — **Also kill local tmux sessions** and **Also
-  kill remote tmux sessions** — both off by default; the kills are
-  fire-and-forget (remote ones reuse the warm SSH connection), so quitting never
-  waits on a slow host.
+- **tmux lifecycle** — closing a **pane** always kills its tmux session. Quitting
+  the **app** leaves sessions alive by design (they reattach next launch): when
+  any exist, the quit dialog offers an **Also kill local tmux sessions**
+  checkbox — off by default; the kill is fire-and-forget, so quitting never waits
+  on it.
 
 ## Localization
 
@@ -886,18 +582,17 @@ feature is added or changed, update the matching entry here in the same change**
 - **Translation catalogs** — bundled per-language JSON under `assets/i18n/`,
   (re)generated by `scripts/translate.py`, which drives the `claude` (sonnet) or
   `opencode` CLI in batches of 25 and keeps technical terms / product names (tmux,
-  SSH, git, worktree, Claude, …) and `{placeholder}` tokens untranslated.
+  git, worktree, Claude, …) and `{placeholder}` tokens untranslated.
   `python3 scripts/translate.py --check` keeps the catalog in sync with the code.
 
 ## Platform & distribution
 
 - **Opt-in focus diagnostics** — the UI profiler correlates GPUI focus-path
-  loss with redraw requests and native Windows ownership. WebView children
+  loss with redraw requests and native window ownership. WebView children
   must descend from a registered Muxel window; unrelated WRY apps remain
   external. Records use fixed class buckets and opaque pane/project UUIDs,
   with no terminal text, URLs, titles, or paths.
-- **Cross-platform** — Linux (x86_64 + arm64), macOS (Intel + Apple Silicon), and
-  Windows (x86_64 + arm64).
+- **Cross-platform** — Linux (x86_64 + arm64) and macOS (Intel + Apple Silicon).
 - **Desktop integration** — app icon and a `.desktop` launcher entry (also the
   notification icon).
 - **Linux: self-cleaning AppImage mounts** — a muxel instance run from an
@@ -907,20 +602,9 @@ feature is added or changed, update the matching entry here in the same change**
   worsens the longer the machine is up. On launch muxel reaps such dead
   `/tmp/.mount_muxel-*` leftovers (leaving live mounts from other running
   instances alone), so they can't accumulate.
-- **In-app updates** — check for and apply updates from within the app: it
-  fetches the latest GitHub Release and self-replaces in place (the AppImage, the
-  portable binary, the Windows `.exe`, or the macOS `.app`), then relaunches;
-  package-managed installs get the right upgrade command instead. The update
-  dialog shows the release's full changelog rendered as markdown, and is
-  resizable.
-- **Windows installer** — a basic per-user Inno Setup installer (`.exe`, no
-  admin) with a Start Menu shortcut and an uninstaller; it installs to a
-  user-writable location so the in-app auto-updater keeps working without
-  elevation. A portable `.zip` is also published.
 - **Packaging & CI** — release packaging per OS/arch on native runners (.deb /
-  .rpm / AppImage / .tar.gz for Linux, .dmg / .zip for macOS, an installer .exe +
-  .zip for Windows) and continuous integration. The macOS `.dmg` opens to the
-  standard drag-onto-Applications layout (the app beside an Applications
-  shortcut). Windows builds are Authenticode-signed; macOS builds are
+  .rpm / AppImage / .tar.gz for Linux, .dmg / .zip for macOS) and continuous
+  integration. The macOS `.dmg` opens to the standard drag-onto-Applications
+  layout (the app beside an Applications shortcut). macOS builds are
   Developer-ID-signed + notarized when an Apple cert is configured (else ad-hoc
   signed).

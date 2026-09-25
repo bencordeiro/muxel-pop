@@ -8,16 +8,10 @@ name: release
 # Outputs:
 #   Linux   — .deb, .rpm, AppImage, .tar.gz (x86_64 + aarch64)
 #   macOS   — a universal .app (Intel x86_64 + Apple Silicon) inside a .dmg + .zip
-#   Windows — portable .zip + an Inno Setup installer .exe (x86_64 + arm64)
 #
 # Linux aarch64 builds on a native ARM64 runner. GPUI can't be cross-compiled
 # across OSes, so each OS builds on its own runner; within macOS, x86_64 is
 # cross-compiled from the Apple Silicon runner (cross-arch in one OS is fine).
-#
-# Windows artifacts (the portable .zip's muxel.exe and the installer .exe) are
-# Authenticode-signed out of band after the build, via Azure Trusted Signing —
-# run `scripts/sign-windows.sh --release <tag>` once the release exists (it
-# re-uploads the signed zips and installers).
 #
 # macOS is signed + notarized in-job by scripts/sign-macos.sh when the MACOS_*
 # secrets (a paid Apple Developer ID + an App Store Connect notary key) are
@@ -313,108 +307,22 @@ jobs:
             muxel-macos-universal.zip
 
   # ----------------------------------------------------------------------------
-  # Windows (x86_64 + arm64): portable .zip per architecture. arm64 is
-  # cross-compiled with the MSVC ARM64 tools bundled in the windows-2022 image.
-  # ----------------------------------------------------------------------------
-  windows:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-pc-windows-msvc
-            name: muxel-windows-x86_64
-            arch: x86_64
-          - target: aarch64-pc-windows-msvc
-            name: muxel-windows-arm64
-            arch: arm64
-    runs-on: windows-2022
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      # rust-toolchain.toml pins the channel, so `targets:` above lands on the
-      # wrong toolchain — add it to the pinned one that cargo actually uses
-      # (the windows-2022 runner only preinstalls the x86_64 target, not arm64).
-      - run: rustup target add ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --target ${{ matrix.target }} -p muxel
-      - name: Package .zip
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/muxel.exe" dist/
-          Copy-Item README.md, LICENSE dist/
-          Compress-Archive -Path dist/* -DestinationPath "${{ matrix.name }}.zip"
-      - name: Build installer (Inno Setup)
-        shell: pwsh
-        run: |
-          # ISCC is the Inno Setup compiler; install it from Chocolatey.
-          choco install innosetup --no-progress -y
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          # Version = the only line-anchored `version = "..."` in the root
-          # Cargo.toml (the workspace package), so this works for both tag pushes
-          # and manual workflow_dispatch runs.
-          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-          # Inno resolves [Files] / SetupIconFile paths relative to the .iss file's
-          # OWN directory, not the cwd — so pass ABSOLUTE source/asset/output dirs.
-          $root = (Get-Location).Path
-          & $iscc "/DMyAppVersion=$ver" "/DMyArch=${{ matrix.arch }}" `
-            "/DSourceDir=$root\dist" "/DAssetDir=$root\crates\muxel\assets" `
-            "/O$root" `
-            "$root\packaging\windows\muxel.iss"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.name }}
-          if-no-files-found: error
-          path: |
-            ${{ matrix.name }}.zip
-            ${{ matrix.name }}-setup.exe
-
-  # ----------------------------------------------------------------------------
   # Collect every package and attach to the GitHub Release (tag pushes only).
   # The intermediate `linux-build-bin-*` artifacts are excluded via the pattern.
   # ----------------------------------------------------------------------------
   release:
-    needs: [linux-packages, macos, windows]
+    needs: [linux-packages, macos]
     runs-on: ubuntu-22.04
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
     steps:
-      # Needed for CHANGELOG.md below. Checked out at the tag, so the notes are
-      # the ones the release was actually cut with.
-      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
           pattern: muxel-*
           merge-multiple: true
-      # The release notes are the changelog section for this version.
-      #
-      # GitHub's generated notes are built from *pull requests*, so anything
-      # pushed straight to master is silently absent from the release page — 0.1.3
-      # went out announcing two of its six changes for exactly that reason. The
-      # changelog doesn't care how a commit arrived.
-      - name: Take the release notes from CHANGELOG.md
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          awk -v header="## [$version]" '
-            index($0, header) == 1 { found = 1; next }   # the version heading
-            found && /^## \[/      { exit }              # the next version ends it
-            found                  { print }
-          ' CHANGELOG.md | sed -e '/./,$!d' > RELEASE_NOTES.md
-          if [ -s RELEASE_NOTES.md ]; then
-            echo "release notes from CHANGELOG.md [$version]:"
-            cat RELEASE_NOTES.md
-          else
-            echo "::warning::no '## [$version]' section in CHANGELOG.md — the release will carry only the generated notes"
-          fi
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/**/*
-          # The changelog section is the body; GitHub appends its generated
-          # "What's Changed" and contributor list underneath it, so PR credit
-          # (e.g. a first-time contributor) is still given.
-          body_path: RELEASE_NOTES.md
           generate_release_notes: true

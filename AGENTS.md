@@ -1,4 +1,4 @@
-# CLAUDE.md
+# AGENTS.md
 
 ## What muxel is
 
@@ -15,9 +15,12 @@ emulator running a PTY child process.
 Cargo workspace, four crates (depend downward only):
 
 - `crates/muxel-core` — the **pure** domain model: the pane layout tree
-  (`PaneNode`), agent presets (`AgentPreset`), worktree naming, tmux arg helpers,
-  and the persisted `Workspace` / `Project` / `Instance` / `Settings` types. No UI,
-  no I/O — fully unit-tested. Most logic that *can* live here, should.
+  (`PaneNode`, `pane.rs`), worktree naming, agent presets (`AgentPreset`), tmux
+  arg helpers, and the persisted `Workspace` / `Project` / `Instance` / `Settings`
+  types. No UI, no I/O — fully unit-tested. Most logic that *can* live here,
+  should. The old `control` / `readaloud` / `stt` / `tts` / `audio` / `ssh` /
+  `remote_ops` / `winshell` modules were removed — this fork is local-only, so
+  no voice, outside-control, or remote code lives here anymore.
 - `crates/muxel-store` — persistence: workspaces, `workspace.json`, and settings,
   loaded/saved under the platform config/data dirs (XDG on Linux).
 - `crates/muxel-terminal` — the PTY child + `alacritty_terminal` emulator
@@ -27,13 +30,18 @@ Cargo workspace, four crates (depend downward only):
 - `crates/muxel` — the GPUI application (`app.rs`, the large `MuxelApp` entity):
   window, sidebar, toolbar, pane rendering, settings UI (`settings_view.rs`),
   editor (`editor.rs`), git/tmux side effects (`integrations.rs`), and embedded
-  assets (icons, themes) wired up in `main.rs`.
+  assets (icons, themes) wired up in `main.rs`. The old `stt` / `tts` / `update` /
+  `control` / `secrets` modules were removed — no speech, in-app updater,
+  outside-control, or keychain code lives here anymore.
 
-`ios/` — a separate **Swift/SwiftUI iOS companion app** (remote-only; peers with
-desktop muxel over SSH/tmux). It is **not** a cargo crate — the `cargo` gate does
-not build it. It re-implements a versioned slice of `muxel-core`'s *remote protocol*
-(tmux session naming, `RemoteLayout` `.muxel/workspace.json`, `classify`/markers); if
-you change those Rust contracts, update the matching Swift port. See `ios/README.md`.
+`ios/` — a separate **Swift/SwiftUI iOS companion app**, intentionally kept
+as-is. It is **not** a cargo crate — the `cargo` gate does not build it. It
+re-implements a **historical** slice of `muxel-core`'s old *remote protocol*
+(tmux session naming, `RemoteLayout` `.muxel/workspace.json`, `classify`/markers)
+from the era when desktop muxel supported remote/SSH projects. Desktop muxel no
+longer implements remote/SSH at all, so nothing on the Rust side speaks that
+protocol any more — `ios/` is kept as a snapshot of it and deliberately does not
+track the desktop code. See `ios/README.md`.
 
 ### Key concepts
 

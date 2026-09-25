@@ -1,7 +1,6 @@
 //! Pure helpers for driving tmux. Building command arguments and names only —
 //! the binary runs the actual `tmux` process.
 
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// A stable tmux session name for an instance, e.g. `muxel_myproj_1a2b3c4d`.
@@ -72,91 +71,11 @@ pub fn parse_sessions(out: &str) -> Vec<RemoteSession> {
     sessions
 }
 
-/// muxel's sessions under `project_root` that **no instance owns** — agents still
-/// running from an earlier run, or started from the iOS app, that nothing in the
-/// workspace points at any more.
-///
-/// They are otherwise unreachable: a session is only ever found by name, from an
-/// instance, so once the instance is gone the running agent is invisible to muxel
-/// while quietly holding the host's resources. `owned` is the resolved session name
-/// ([`session_for`]) of every instance in the project.
-///
-/// Sessions outside the project's tree, and any session not started by muxel, are
-/// left strictly alone — this adopts, it never adopts *someone else's* tmux.
-///
-/// A session in `closed` is never adopted either: the user closed that pane, and
-/// its kill has not been confirmed. Adopting it would undo a deliberate close every
-/// time a kill failed to land — the agent would come back, still running, as if
-/// muxel had never been told to stop it.
-pub fn orphan_sessions(
-    sessions: &[RemoteSession],
-    project_root: &str,
-    owned: &[String],
-    closed: &[ClosedSession],
-) -> Vec<RemoteSession> {
-    sessions
-        .iter()
-        .filter(|s| s.name.starts_with(SESSION_PREFIX))
-        .filter(|s| in_tree(&s.path, project_root))
-        .filter(|s| !owned.iter().any(|o| o == &s.name))
-        .filter(|s| !closed.iter().any(|c| c.matches(s)))
-        .cloned()
-        .collect()
-}
-
-/// Whether `path` is `root` or sits beneath it (a worktree, say).
-fn in_tree(path: &str, root: &str) -> bool {
-    let root = root.trim_end_matches('/');
-    let path = path.trim_end_matches('/');
-    path == root || path.strip_prefix(root).is_some_and(|r| r.starts_with('/'))
-}
-
 /// The `_<uuid8>` tail every muxel session name ends with — the one part of the
 /// name that is the same whichever slug the peer that created it used.
 fn instance_suffix(instance: Uuid) -> String {
     let id = instance.simple().to_string();
     format!("_{}", &id[..8])
-}
-
-/// A tmux session whose pane the user deliberately closed, kept until the host has
-/// confirmed the session is actually gone.
-///
-/// Killing a remote session is one `ssh` round trip that can simply fail — a blip,
-/// a control socket that went away with the pane's own ssh, a host that is briefly
-/// unreachable. Unremembered, that failure is silent *and* self-reversing: the
-/// agent keeps running on the host, and the next connect sees a muxel session no
-/// instance owns and adopts it straight back into a pane
-/// ([`orphan_sessions`]). Remembering the close is what lets muxel finish the
-/// kill later and, until it has, refuse to resurrect the pane.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClosedSession {
-    /// The session name the closed pane was launched with.
-    pub name: String,
-    /// The closed instance. The name is derived from a slug that can change under
-    /// muxel's feet (a renamed host, a session a peer created under its own slug),
-    /// so the instance's `_<uuid8>` suffix is the durable half of the match.
-    pub instance: Uuid,
-}
-
-impl ClosedSession {
-    /// Whether `session` is the one this close was meant to reap.
-    pub fn matches(&self, session: &RemoteSession) -> bool {
-        session.name == self.name || session.name.ends_with(&instance_suffix(self.instance))
-    }
-}
-
-/// The session a remembered close still has running on the host, if any.
-///
-/// `None` means the kill landed (or the session was never there) and the entry can
-/// be forgotten. `Some` carries the session under **its own** name, which is what a
-/// retry must target — a derived name can have drifted since the pane launched.
-pub fn live_closed_session<'a>(
-    sessions: &'a [RemoteSession],
-    closed: &ClosedSession,
-) -> Option<&'a RemoteSession> {
-    sessions
-        .iter()
-        .find(|s| s.name.starts_with(SESSION_PREFIX) && closed.matches(s))
 }
 
 /// The tmux session an instance uses: the name **recorded on the instance** wins;
@@ -483,16 +402,6 @@ mod tests {
         assert_eq!(session_for(Some("   "), "rhel", id), "muxel_rhel_1a2b3c4d");
     }
 
-    fn sessions() -> Vec<RemoteSession> {
-        parse_sessions(concat!(
-            "muxel_sro_client_90f9def0|/home/ryan/Projects/sro_client|claude\n",
-            "muxel_sro_client_d0d464c4|/home/ryan/Projects/sro_client|claude\n",
-            "muxel_rhel_ae15cabf|/home/ryan/Projects/Bot/Manager|claude\n",
-            "muxel_codem_6b80c97f|/home/ryan/Projects/codem|claude\n",
-            "work|/home/ryan|zsh\n",
-        ))
-    }
-
     #[test]
     fn parse_keeps_the_first_pane_of_each_session() {
         let s = parse_sessions("a|/p|claude\na|/p|node\nb|/q|zsh\ngarbage-line\n|/r|zsh\nc|/s\n");
@@ -500,104 +409,6 @@ mod tests {
         assert_eq!(s[0].name, "a");
         assert_eq!(s[0].command, "claude", "the first pane wins");
         assert_eq!(s[1].path, "/q");
-    }
-
-    /// The whole point: sessions still running in this project that nothing owns.
-    #[test]
-    fn orphans_are_this_projects_unowned_muxel_sessions() {
-        let owned = vec!["muxel_sro_client_d0d464c4".to_string()];
-        let orphans = orphan_sessions(&sessions(), "/home/ryan/Projects/sro_client", &owned, &[]);
-        assert_eq!(
-            orphans.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            ["muxel_sro_client_90f9def0"],
-            "an owned session, another project's, and a non-muxel session are all left alone"
-        );
-        assert_eq!(orphans[0].command, "claude");
-    }
-
-    /// A session named for the *host* still belongs to whichever project it was
-    /// started in — the path decides, not the slug.
-    #[test]
-    fn a_host_named_session_is_attributed_by_its_path() {
-        let orphans = orphan_sessions(&sessions(), "/home/ryan/Projects/Bot/Manager", &[], &[]);
-        assert_eq!(
-            orphans.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            ["muxel_rhel_ae15cabf"]
-        );
-    }
-
-    /// A worktree lives under the project root, and its session belongs to it. But a
-    /// sibling directory that merely shares a prefix does not.
-    #[test]
-    fn the_project_tree_includes_worktrees_but_not_prefix_siblings() {
-        let s = parse_sessions(concat!(
-            "muxel_p_00000001|/home/ryan/Projects/app/.worktrees/feat|claude\n",
-            "muxel_p_00000002|/home/ryan/Projects/app-other|claude\n",
-        ));
-        let orphans = orphan_sessions(&s, "/home/ryan/Projects/app", &[], &[]);
-        assert_eq!(
-            orphans.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            ["muxel_p_00000001"]
-        );
-    }
-
-    /// muxel adopts only its own sessions — never the user's own tmux.
-    #[test]
-    fn a_users_own_session_is_never_adopted() {
-        let s = parse_sessions("work|/home/ryan/Projects/app|vim\n");
-        assert!(orphan_sessions(&s, "/home/ryan/Projects/app", &[], &[]).is_empty());
-    }
-
-    fn closed(name: &str, id: Uuid) -> ClosedSession {
-        ClosedSession {
-            name: name.to_string(),
-            instance: id,
-        }
-    }
-
-    /// The bug this exists for: a remote close whose kill didn't land left the
-    /// session running, and the next connect adopted it straight back into a pane.
-    #[test]
-    fn a_session_whose_close_is_unconfirmed_is_never_adopted_back() {
-        let id = Uuid::parse_str("90f9def0-0000-4000-8000-000000000000").unwrap();
-        let c = [closed("muxel_sro_client_90f9def0", id)];
-        let orphans = orphan_sessions(&sessions(), "/home/ryan/Projects/sro_client", &[], &c);
-        assert_eq!(
-            orphans.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            ["muxel_sro_client_d0d464c4"],
-            "only the session nobody closed comes back"
-        );
-    }
-
-    /// The recorded name is derived from a slug that can drift (a renamed host, a
-    /// session a peer created under its own slug). The instance suffix still pins it.
-    #[test]
-    fn a_close_matches_its_session_under_a_different_slug() {
-        let id = Uuid::parse_str("ae15cabf-0000-4000-8000-000000000000").unwrap();
-        let c = closed("muxel_oldhostname_ae15cabf", id);
-        assert_eq!(
-            live_closed_session(&sessions(), &c).map(|s| s.name.as_str()),
-            Some("muxel_rhel_ae15cabf"),
-            "a retry must target the name the session actually has"
-        );
-        assert!(
-            orphan_sessions(&sessions(), "/home/ryan/Projects/Bot/Manager", &[], &[c]).is_empty()
-        );
-    }
-
-    /// Once the host no longer lists it, the close is finished and forgettable.
-    #[test]
-    fn a_close_with_no_session_left_running_is_done() {
-        let id = Uuid::parse_str("11111111-0000-4000-8000-000000000000").unwrap();
-        assert!(live_closed_session(&sessions(), &closed("muxel_gone_11111111", id)).is_none());
-    }
-
-    /// Never reap a session that isn't muxel's, however the name lines up.
-    #[test]
-    fn a_close_never_matches_a_users_own_session() {
-        let id = Uuid::parse_str("00000001-0000-4000-8000-000000000000").unwrap();
-        let s = parse_sessions("work_00000001|/home/ryan|vim\n");
-        assert!(live_closed_session(&s, &closed("muxel_p_00000001", id)).is_none());
     }
 
     #[test]

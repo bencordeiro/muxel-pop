@@ -1605,7 +1605,7 @@ impl TerminalSession {
 /// spawn work (see PR #4).
 #[cfg(unix)]
 fn quote_path_for_shell(path: &str) -> String {
-    muxel_core::ssh::sh_quote(path)
+    muxel_core::sh_quote(path)
 }
 
 #[cfg(not(unix))]

@@ -35,7 +35,7 @@ const FOCUSED_INTERACTION_INTERVAL: Duration = Duration::from_millis(8);
 /// Working→Done→Working lifecycle and duplicate completion notifications.
 const GROK_SCREEN_WORKING_HOLD: Duration = Duration::from_secs(2);
 
-/// Pure paint-priority policy (see `docs/terminal-paint-architecture.md`).
+/// Pure paint-priority policy.
 /// Extracted so we can unit-test without a full GPUI window.
 pub(crate) fn paint_min_interval(focused: bool, interactive: bool, stop: bool) -> Duration {
     if stop {
@@ -1380,7 +1380,7 @@ impl TerminalView {
                             view.exit_signal = info.signal;
                             view.exit_read_error = info.read_error;
                         }
-                        // Priority scheduler (see docs/terminal-paint-architecture.md):
+                        // Priority scheduler:
                         // Recent input ≫ stream; every throttled batch gets one
                         // trailing-edge notify if no later output arrives.
                         let interactive = view.session.is_interactive();

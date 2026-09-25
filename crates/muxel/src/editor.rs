@@ -500,16 +500,6 @@ impl EditorView {
 
     /// Replace the buffer contents (used after an async remote read), keeping the
     /// path/language, and clear the dirty flag.
-    pub fn set_content(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.input.update(cx, |s, cx| s.set_value(text, window, cx));
-        self.dirty = false;
-        self.external_change = None;
-        self.disk_stamp = self.path.as_deref().and_then(disk_stamp);
-        cx.notify();
-    }
-
-    /// Point the editor at a new on-disk path (after Save As), re-detecting the
-    /// syntax language, and clear the dirty flag.
     pub fn set_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let lang = language_for_path(&path).to_string();
         let stamp = disk_stamp(&path);

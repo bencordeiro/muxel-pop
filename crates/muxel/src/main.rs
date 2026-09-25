@@ -11,22 +11,17 @@ mod app;
 mod browser;
 #[cfg(target_os = "linux")]
 mod browser_helper;
-mod control;
 mod editor;
 mod filetree;
 mod i18n;
 mod integrations;
 #[cfg(target_os = "windows")]
 mod present_pump;
-mod secrets;
 mod session_binding;
 mod settings_view;
 mod split;
-mod stt;
 mod theme;
-mod tts;
 mod ui_profile;
-mod update;
 
 use app::MuxelApp;
 use gpui::*;
@@ -185,11 +180,6 @@ fn raise_open_file_limit() {
 }
 
 fn main() {
-    // `muxel ctl …` talks to the running app and exits; it never opens a window.
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("ctl") {
-        std::process::exit(control::run_cli(&args[1..]));
-    }
     match session_binding::hook_instance_from_args(
         std::env::args_os().skip(1),
         std::env::var_os(session_binding::MUXEL_INSTANCE_ID_ENV),
@@ -275,36 +265,6 @@ fn main() {
         }
     }
 
-    // The local (Kokoro) voice: phonemize with the bundled CMU dictionary, never
-    // with a system espeak-ng.
-    //
-    // Only compiled in with `--features voice-local`; nothing speaks by default.
-    //
-    // `kokoro-en` probes for an `espeak-ng` binary at RUNTIME and prefers it if it
-    // finds one — and that path mangles word-final phonemes: "by" → "bee",
-    // "online" → "onlin", "evening" → "evenin". It is audible as the last sound of
-    // every word being clipped. The dictionary gets all of them right, digits
-    // included ("12 agents" → twˈɛlv ˈeɪdʒənts).
-    //
-    // Compiling espeak out (`misaki-lean`, see Cargo.toml) is not enough on its
-    // own, because that only drops the *bundled* copy. Without this the voice would
-    // also be nondeterministic — muxel would speak differently depending on whether
-    // espeak-ng happened to be installed, which is exactly how this went unnoticed.
-    //
-    // SAFETY: still single-threaded here (before the GPUI app starts) — and this
-    // must precede the thread spawned just below.
-    #[cfg(feature = "voice-local")]
-    unsafe {
-        std::env::set_var("KOKORO_ESPEAK_NG", "0")
-    };
-
-    // Reap stale muxel AppImage squashfuse mounts left in /tmp by prior instances
-    // that crashed or were SIGKILLed before the runtime could unmount them —
-    // otherwise a dead mount makes filesystem scans (e.g. a desktop monitor's
-    // `df`) stall in the kernel FUSE layer and shows up as a periodic cursor
-    // stutter on Wayland. Detached, so it never blocks startup. Must follow the
-    // `set_var` blocks above: it spawns a thread, and `set_var` needs the process
-    // still single-threaded.
     #[cfg(target_os = "linux")]
     integrations::reap_stale_appimage_mounts();
 

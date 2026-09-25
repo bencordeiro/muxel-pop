@@ -7,17 +7,8 @@
 use crate::i18n::t;
 use gpui::*;
 use gpui_component::input::InputState;
-use muxel_core::{EnvVar, InjectionMode, PresetKind, SshAuth};
+use muxel_core::{EnvVar, InjectionMode, PresetKind};
 use uuid::Uuid;
-
-/// Inline result of a "Test connection" in the SSH host editor.
-#[derive(Clone)]
-pub enum RemoteTestState {
-    Idle,
-    Testing,
-    Ok(String),
-    Failed(String),
-}
 
 /// Configurable actions: `(action, default keystroke, key context)`. The names
 /// are matched in `app::keybinding_for` to the corresponding gpui actions; the
@@ -57,12 +48,6 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str, Option<&str>)] = &[
     ("FocusAttention", "ctrl-shift-a", None),
     ("ShowKeys", "ctrl-shift-/", None),
     ("ToggleBroadcast", "ctrl-shift-i", None),
-    ("ToggleSpeechToText", "ctrl-shift-m", None),
-    ("HoldSpeechToText", "ctrl-shift-h", None),
-    // Read the focused agent's last reply aloud; again pauses, again resumes.
-    ("ReadAloud", "ctrl-shift-r", None),
-    ("ReadAloudRestart", "ctrl-alt-r", None),
-    ("ReadAloudStop", "ctrl-alt-s", None),
     // Toggle the toolbar's "new agents get a git worktree" switch.
     ("ToggleWorktree", "ctrl-shift-g", None),
     // OS fullscreen; the sidebar hides until revealed or fullscreen exits.
@@ -113,16 +98,10 @@ pub enum SettingsSection {
     Appearance,
     Editor,
     Behavior,
-    Speech,
-    ReadAloud,
     Agents,
-    /// Setting up Grok Bot (or another agent) to drive muxel through `muxel ctl`.
-    GrokBot,
     Runners,
     Snippets,
     Loops,
-    Remotes,
-    Identities,
     Projects,
     Keybindings,
 }
@@ -180,52 +159,6 @@ pub struct SettingsUi {
     pub l_hour: Entity<InputState>,
     pub l_minute: Entity<InputState>,
 
-    // Grok Bot tab.
-    /// Inline result of the last "Test" (running `muxel ctl` as Grok Bot would).
-    pub grok_test: RemoteTestState,
-    /// Whether the skill's full text is shown below its Copy button.
-    pub grok_skill_preview: bool,
-    /// The skill has been copied to the clipboard (shown beside the button).
-    pub grok_skill_copied: bool,
-
-    // SSH remote-host editor.
-    pub selected_remote: Option<usize>,
-    pub s_auth: SshAuth,
-    /// Inline result of the last "Test connection".
-    pub s_test: RemoteTestState,
-    /// Cached "a password is stored in the keychain" flag for the open host
-    /// (refreshed on open/save, so render doesn't hit the keychain every frame).
-    pub s_has_password: bool,
-    pub s_forward_agent: bool,
-    pub s_compression: bool,
-    pub s_use_tmux: bool,
-    /// Which OS the selected host runs — decides the whole remote command
-    /// vocabulary, and whether the tmux row is offered at all.
-    pub s_remote_os: muxel_core::RemoteOs,
-    /// Shell an interactive pane runs on a Windows host.
-    pub s_windows_shell: muxel_core::winshell::WindowsShell,
-    pub s_name: Entity<InputState>,
-    pub s_host: Entity<InputState>,
-    pub s_port: Entity<InputState>,
-    pub s_user: Entity<InputState>,
-    pub s_identity: Entity<InputState>,
-    pub s_password: Entity<InputState>,
-    pub s_jump: Entity<InputState>,
-    pub s_keepalive: Entity<InputState>,
-    pub s_strict: Entity<InputState>,
-    pub s_extra: Entity<InputState>,
-    /// Shared login identity chosen for the open host (None = inline credentials).
-    pub s_identity_id: Option<Uuid>,
-
-    // Shared login-identity editor.
-    pub selected_identity: Option<usize>,
-    pub id_auth: SshAuth,
-    pub id_has_password: bool,
-    pub id_name: Entity<InputState>,
-    pub id_user: Entity<InputState>,
-    pub id_identity: Entity<InputState>,
-    pub id_password: Entity<InputState>,
-
     // Project editor.
     pub selected_project: Option<Uuid>,
     pub proj_name: Entity<InputState>,
@@ -235,26 +168,6 @@ pub struct SettingsUi {
 
     // Editor.
     pub editor_font_family: Entity<InputState>,
-
-    // Speech-to-text.
-    pub stt_provider_url: Entity<InputState>,
-    pub stt_provider_model: Entity<InputState>,
-    pub stt_language: Entity<InputState>,
-    pub stt_api_key: Entity<InputState>,
-    /// The spoken phrase that triggers the wake command.
-    pub stt_wake_phrase: Entity<InputState>,
-    /// Whether a provider API key is stored (cached so render doesn't hit the
-    /// keychain every frame).
-    pub stt_has_key: bool,
-
-    // Read aloud (text-to-speech).
-    /// OS voice name, typed — for systems muxel can't list voices on (Linux).
-    pub tts_system_voice: Entity<InputState>,
-    pub tts_provider_voice: Entity<InputState>,
-    pub tts_provider_model: Entity<InputState>,
-    /// The OS voices, `(name, locale)`, listed once in the background the first
-    /// time Settings opens (`None` until then).
-    pub tts_system_voices: Option<Vec<(String, String)>>,
 
     // Keybindings (action name -> keystroke input).
     pub keybinds: Vec<(String, Entity<InputState>)>,
@@ -334,87 +247,12 @@ impl SettingsUi {
             l_interval: cx.new(|cx| InputState::new(window, cx).placeholder("1")),
             l_hour: cx.new(|cx| InputState::new(window, cx).placeholder("9")),
             l_minute: cx.new(|cx| InputState::new(window, cx).placeholder("00")),
-            grok_test: RemoteTestState::Idle,
-            grok_skill_preview: false,
-            grok_skill_copied: false,
-            selected_remote: None,
-            s_auth: SshAuth::Agent,
-            s_test: RemoteTestState::Idle,
-            s_has_password: false,
-            s_forward_agent: false,
-            s_compression: false,
-            s_use_tmux: true,
-            s_remote_os: muxel_core::RemoteOs::default(),
-            s_windows_shell: muxel_core::winshell::WindowsShell::default(),
-            s_name: cx.new(|cx| InputState::new(window, cx).placeholder(t("Name"))),
-            s_host: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder(t("host.example.com or ~/.ssh/config alias"))
-            }),
-            s_port: cx.new(|cx| InputState::new(window, cx).placeholder("22")),
-            s_user: cx
-                .new(|cx| InputState::new(window, cx).placeholder(t("login user (optional)"))),
-            s_identity: cx
-                .new(|cx| InputState::new(window, cx).placeholder(t("~/.ssh/id_ed25519"))),
-            s_password: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .masked(true)
-                    .placeholder(t("stored in the OS keychain"))
-            }),
-            s_jump: cx
-                .new(|cx| InputState::new(window, cx).placeholder(t("ProxyJump host (optional)"))),
-            s_keepalive: cx
-                .new(|cx| InputState::new(window, cx).placeholder(t("ServerAliveInterval secs"))),
-            s_strict: cx.new(|cx| InputState::new(window, cx).placeholder(t("accept-new"))),
-            s_extra: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .multi_line(true)
-                    .placeholder(t("extra -o options, one KEY=VALUE per line"))
-            }),
-            s_identity_id: None,
-            selected_identity: None,
-            id_auth: SshAuth::Agent,
-            id_has_password: false,
-            id_name: cx.new(|cx| InputState::new(window, cx).placeholder(t("Name"))),
-            id_user: cx
-                .new(|cx| InputState::new(window, cx).placeholder(t("login user (optional)"))),
-            id_identity: cx
-                .new(|cx| InputState::new(window, cx).placeholder(t("~/.ssh/id_ed25519"))),
-            id_password: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .masked(true)
-                    .placeholder(t("stored in the OS keychain"))
-            }),
             selected_project: None,
             proj_name: cx.new(|cx| InputState::new(window, cx).placeholder(t("Project name"))),
             font_family: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t("DejaVu Sans Mono"))),
             editor_font_family: cx
                 .new(|cx| InputState::new(window, cx).placeholder(t("theme monospace"))),
-            stt_provider_url: cx
-                .new(|cx| InputState::new(window, cx).placeholder(t("https://api.openai.com/v1"))),
-            stt_provider_model: cx
-                .new(|cx| InputState::new(window, cx).placeholder(t("whisper-1"))),
-            stt_language: cx.new(|cx| InputState::new(window, cx).placeholder(t("auto-detect"))),
-            stt_api_key: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .masked(true)
-                    .placeholder(t("stored in the OS keychain"))
-            }),
-            stt_wake_phrase: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder(muxel_core::stt::DEFAULT_WAKE_PHRASE.to_string())
-            }),
-            stt_has_key: false,
-            tts_system_voice: cx
-                .new(|cx| InputState::new(window, cx).placeholder(t("OS default voice"))),
-            tts_provider_voice: cx.new(|cx| {
-                InputState::new(window, cx).placeholder(muxel_core::tts::DEFAULT_TTS_VOICE)
-            }),
-            tts_provider_model: cx.new(|cx| {
-                InputState::new(window, cx).placeholder(muxel_core::tts::DEFAULT_TTS_PROVIDER_MODEL)
-            }),
-            tts_system_voices: None,
             keybinds: DEFAULT_KEYBINDINGS
                 .iter()
                 .map(|(name, default, _ctx)| {

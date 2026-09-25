@@ -36,6 +36,6 @@ cargo test --workspace
 cargo build -p muxel
 ```
 
-`CLAUDE.md` documents the workspace layout and project conventions. Keep pure,
+`AGENTS.md` documents the workspace layout and project conventions. Keep pure,
 testable logic in `muxel-core`, and add a `FEATURES.md` entry when you add or
 change a user-facing feature.

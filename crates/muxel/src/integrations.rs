@@ -4,9 +4,7 @@
 use crate::i18n::{t, tf};
 use anyhow::{Context, Result, bail};
 use muxel_core::memory::{self, MemoryEntry};
-use muxel_core::{
-    MEMORY_DIR, MEMORY_FILE, RemoteHost, RemoteOs, SshAuth, memory_header, remote_ops, ssh,
-};
+use muxel_core::{MEMORY_DIR, MEMORY_FILE, memory_header};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -94,208 +92,26 @@ fn lazy_unmount_fuse(mountpoint: &str) -> bool {
     })
 }
 
-/// A remote git location: the host + the repo path on it + the shared
-/// ControlMaster socket + (optional) password for password auth.
-pub struct RemoteConn {
-    pub host: RemoteHost,
-    pub remote_path: String,
-    pub control_path: String,
-    pub password: Option<String>,
-}
-
-/// Where a git command runs: a local working tree, or a remote one reached over
-/// SSH (reusing the host's ControlMaster, so repeated calls are cheap). The
-/// remote variant is boxed (it's much larger than the local one).
-pub enum RepoLoc {
-    Local(PathBuf),
-    Remote(Box<RemoteConn>),
-}
+/// Where a git command runs: a local working tree.
+pub struct RepoLoc(PathBuf);
 
 impl RepoLoc {
-    pub fn remote(
-        host: RemoteHost,
-        remote_path: String,
-        control_path: String,
-        password: Option<String>,
-    ) -> Self {
-        RepoLoc::Remote(Box::new(RemoteConn {
-            host,
-            remote_path,
-            control_path,
-            password,
-        }))
+    pub fn new(p: impl Into<PathBuf>) -> Self {
+        Self(p.into())
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
     }
 }
 
-/// Build the local `ssh`/`sshpass` Command that runs `remote_cmd` (one shell
-/// string) on the connection's host, reusing its ControlMaster.
-fn remote_ssh_command(c: &RemoteConn, remote_cmd: String) -> Command {
-    let mut argv = ssh::connection_args(&c.host, &c.control_path);
-    // `ConnectTimeout` comes from `base_args`; `BatchMode` makes a key/agent
-    // failure fail fast instead of blocking on a password prompt to a non-tty.
-    if c.password.is_none() {
-        argv.push("-o".into());
-        argv.push("BatchMode=yes".into());
-    }
-    argv.push(ssh::target(&c.host));
-    argv.push("--".into());
-    argv.push(remote_cmd);
-    if c.host.auth == SshAuth::Password {
-        let mut cmd = command("sshpass");
-        cmd.arg("-e").arg("ssh").args(&argv);
-        if let Some(pw) = &c.password {
-            cmd.env("SSHPASS", pw);
-        }
-        cmd
-    } else {
-        let mut cmd = command("ssh");
-        cmd.args(&argv);
-        cmd
-    }
-}
-
-/// Run `git <args>` at a [`RepoLoc`]: locally (`git -C <path>`) or on the host
-/// over SSH (`ssh … -- git -C <remote_path> …`, fed as one quoted command).
+/// Run `git <args>` at a [`RepoLoc`]: `git -C <path> …`.
 fn git_output(loc: &RepoLoc, args: &[&str]) -> std::io::Result<std::process::Output> {
-    match loc {
-        RepoLoc::Local(path) => command("git").arg("-C").arg(path).args(args).output(),
-        RepoLoc::Remote(c) => {
-            let remote = remote_ops::git(c.host.os, &c.remote_path, args);
-            remote_ssh_command(c, remote).output()
-        }
-    }
+    command("git").arg("-C").arg(loc.path()).args(args).output()
 }
 
-/// Cap on the size of a remote file muxel will read into the editor (2 MB).
-const MAX_REMOTE_BYTES: u64 = 2_000_000;
-
-/// List files under a remote project root: gitignore-aware via `git ls-files`
-/// (tracked + untracked) when it's a repo, else a bounded `find`. Returns
-/// absolute remote paths (capped). Empty for a local loc or on failure.
-pub fn list_remote_files(loc: &RepoLoc) -> Vec<String> {
-    let RepoLoc::Remote(c) = loc else {
-        return Vec::new();
-    };
-    let root = c.remote_path.trim_end_matches('/');
-    // Same cap as the local walk: the old 10k quietly cut large trees off, and a
-    // folder whose files all fell past the cut just vanished from the browser.
-    let cap = crate::app::MAX_PROJECT_FILES;
-    let cmd = remote_ops::list_files(c.host.os, root, cap);
-    let Ok(out) = remote_ssh_command(c, cmd).output() else {
-        return Vec::new();
-    };
-    if !out.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(|l| l.trim().trim_start_matches("./"))
-        .filter(|l| !l.is_empty())
-        .map(|rel| format!("{root}/{rel}"))
-        .collect()
-}
-
-/// Read a remote text file's contents (capped at [`MAX_REMOTE_BYTES`]). `None` on
-/// failure, a local loc, or if the file is too large.
-pub fn read_remote_file(loc: &RepoLoc, abs_path: &str) -> Option<String> {
-    let RepoLoc::Remote(c) = loc else {
-        return None;
-    };
-    // Only read when it's a regular file within the size cap.
-    let cmd = remote_ops::read_file(c.host.os, abs_path, MAX_REMOTE_BYTES);
-    let out = remote_ssh_command(c, cmd).output().ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// Every tmux session on a remote host — the input to adopting the ones no instance
-/// owns (see `muxel_core::tmux::orphan_sessions`). `None` when the host can't be
-/// reached or tmux isn't there; an empty list means "reached it, no sessions", and
-/// the two must not be confused — a blip would otherwise read as "nothing running".
-pub fn list_remote_tmux_sessions(loc: &RepoLoc) -> Option<Vec<muxel_core::tmux::RemoteSession>> {
-    let RepoLoc::Remote(c) = loc else {
-        return None;
-    };
-    if c.host.os.is_windows() {
-        // No tmux on Windows, so there is nothing to adopt. `Some(empty)` rather
-        // than `None`: the host is reachable and genuinely has no sessions, and
-        // `None` would read as "couldn't reach it" and strand the UI in a retry.
-        return Some(Vec::new());
-    }
-    let args = muxel_core::tmux::list_sessions_args();
-    // `tmux` is not on sshd's bare default PATH when it came from Homebrew — see
-    // `ssh::tmux_path_prelude`. Unresolved, this reads as "no sessions on the host"
-    // and every running agent there stays stranded.
-    let cmd = std::iter::once("tmux".to_string())
-        .chain(args.iter().map(|a| ssh::sh_quote(a)))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let cmd = format!("{}; {cmd}", ssh::tmux_path_prelude());
-    let out = remote_ssh_command(c, cmd).output().ok()?;
-    if !out.status.success() {
-        // "no server running" is a perfectly good answer: nothing is running there.
-        let err = String::from_utf8_lossy(&out.stderr);
-        return err.contains("no server running").then(Vec::new);
-    }
-    Some(muxel_core::tmux::parse_sessions(&String::from_utf8_lossy(
-        &out.stdout,
-    )))
-}
-
-/// Every tmux session on this machine, as [`list_remote_tmux_sessions`] reports a
-/// host's. An empty list when no tmux server is running; `None` when tmux couldn't
-/// be run at all.
-pub fn list_local_tmux_sessions() -> Option<Vec<muxel_core::tmux::RemoteSession>> {
-    let out = command("tmux")
-        .args(muxel_core::tmux::list_sessions_args())
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        // No server (or no socket yet) is a perfectly good answer: nothing running.
-        let err = String::from_utf8_lossy(&out.stderr);
-        return (err.contains("no server running") || err.contains("error connecting to"))
-            .then(Vec::new);
-    }
-    Some(muxel_core::tmux::parse_sessions(&String::from_utf8_lossy(
-        &out.stdout,
-    )))
-}
-
-/// Write `content` to a remote file (overwriting), piping it over SSH stdin.
-pub fn write_remote_file(loc: &RepoLoc, abs_path: &str, content: &str) -> Result<()> {
-    let RepoLoc::Remote(c) = loc else {
-        bail!("not a remote file");
-    };
-    use std::io::Write;
-    let cmd = remote_ops::write_file(c.host.os, abs_path);
-    let mut command = remote_ssh_command(c, cmd);
-    command
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|e| ssh_spawn_error(c.host.auth, e))?;
-    child
-        .stdin
-        .take()
-        .context("ssh stdin")?
-        .write_all(content.as_bytes())
-        .context("writing remote file")?;
-    let out = child.wait_with_output().context("waiting for ssh")?;
-    if !out.status.success() {
-        let msg = String::from_utf8_lossy(&out.stderr);
-        let msg = msg.trim();
-        bail!("{}", if msg.is_empty() { "write failed" } else { msg });
-    }
-    Ok(())
-}
-
-/// Add `ignore_line` to `<root>/.gitignore` if not already present (the bare
-/// `MEMORY_DIR` form counts too). Idempotent; shared by the memory-file and
-/// layout-sync writers.
+/// Every tmux session on this machine. An empty list when no tmux server is
+/// running; `None` when tmux couldn't be run at all.
 fn ensure_gitignored(root: &Path, ignore_line: &str) -> Result<()> {
     let gitignore = root.join(".gitignore");
     let current = std::fs::read_to_string(&gitignore).unwrap_or_default();
@@ -316,198 +132,44 @@ fn ensure_gitignored(root: &Path, ignore_line: &str) -> Result<()> {
 
 /// Ensure a project's shared memory file exists and is git-ignored, idempotently:
 /// create `<root>/.muxel/`, seed `MEMORY.md` if absent, and add `.muxel/` to the
-/// repo's `.gitignore` if not already there. Works for a local or remote `loc`.
+/// repo's `.gitignore` if not already there.
 pub fn ensure_memory_file(loc: &RepoLoc) -> Result<()> {
+    let root = loc.path();
     let ignore_line = format!("{MEMORY_DIR}/");
-    match loc {
-        RepoLoc::Local(root) => {
-            let dir = root.join(MEMORY_DIR);
-            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-            let file = dir.join(MEMORY_FILE);
-            if !file.exists() {
-                std::fs::write(&file, memory_header())
-                    .with_context(|| format!("writing {}", file.display()))?;
-            }
-            ensure_gitignored(root, &ignore_line)
-        }
-        RepoLoc::Remote(c) => {
-            let root = c.remote_path.trim_end_matches('/');
-            let file = format!("{MEMORY_DIR}/{MEMORY_FILE}");
-            let cmd = remote_ops::ensure_seeded_file(
-                c.host.os,
-                root,
-                MEMORY_DIR,
-                &file,
-                memory_header(),
-                &ignore_line,
-            );
-            let out = remote_ssh_command(c, cmd)
-                .output()
-                .map_err(|e| ssh_spawn_error(c.host.auth, e))?;
-            if !out.status.success() {
-                let msg = String::from_utf8_lossy(&out.stderr);
-                let msg = msg.trim();
-                bail!(
-                    "{}",
-                    if msg.is_empty() {
-                        "ensure memory failed"
-                    } else {
-                        msg
-                    }
-                );
-            }
-            Ok(())
-        }
+    let dir = root.join(MEMORY_DIR);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let file = dir.join(MEMORY_FILE);
+    if !file.exists() {
+        std::fs::write(&file, memory_header())
+            .with_context(|| format!("writing {}", file.display()))?;
     }
+    ensure_gitignored(root, &ignore_line)
 }
 
-/// Absolute path of a project's `.muxel/MEMORY.md`, local or remote.
-fn memory_abs(loc: &RepoLoc) -> String {
-    match loc {
-        RepoLoc::Local(root) => root
-            .join(MEMORY_DIR)
-            .join(MEMORY_FILE)
-            .display()
-            .to_string(),
-        RepoLoc::Remote(c) => format!(
-            "{}/{MEMORY_DIR}/{MEMORY_FILE}",
-            c.remote_path.trim_end_matches('/')
-        ),
-    }
+/// Absolute path of a project's `.muxel/MEMORY.md`.
+fn memory_abs(loc: &RepoLoc) -> PathBuf {
+    loc.path().join(MEMORY_DIR).join(MEMORY_FILE)
 }
 
 /// Read and parse a project's memory file into entries. Missing/empty/unreadable →
-/// an empty list (the file is optional and created on first save). Works local or
-/// remote.
+/// an empty list (the file is optional and created on first save).
 pub fn load_memory(loc: &RepoLoc) -> Vec<MemoryEntry> {
-    let text = match loc {
-        RepoLoc::Local(root) => {
-            std::fs::read_to_string(root.join(MEMORY_DIR).join(MEMORY_FILE)).unwrap_or_default()
-        }
-        RepoLoc::Remote(_) => read_remote_file(loc, &memory_abs(loc)).unwrap_or_default(),
-    };
+    let text = std::fs::read_to_string(memory_abs(loc)).unwrap_or_default();
     memory::parse_document(&text)
 }
 
 /// Whether the project already has a `.muxel/MEMORY.md` — i.e. shared memory is
-/// plainly in use here, whoever switched it on. Local or remote.
+/// plainly in use here, whoever switched it on.
 ///
 /// The evidence of last resort for the shared-memory flag: a layout doc written
 /// before that flag existed carries no opinion, and defaulting such a project to
 /// "off" would show the toggle off for a project whose agents are demonstrably
 /// sharing a memory file on the host.
-pub fn memory_file_exists(loc: &RepoLoc) -> bool {
-    match loc {
-        RepoLoc::Local(root) => root.join(MEMORY_DIR).join(MEMORY_FILE).is_file(),
-        RepoLoc::Remote(c) => {
-            let cmd = remote_ops::test_file(c.host.os, &memory_abs(loc));
-            remote_ssh_command(c, cmd)
-                .output()
-                .is_ok_and(|o| o.status.success())
-        }
-    }
-}
-
-/// Render `entries` to the project's `.muxel/MEMORY.md` (overwriting). Ensures the
-/// `.muxel/` dir exists and is git-ignored first. Works local or remote.
 pub fn save_memory(loc: &RepoLoc, entries: &[MemoryEntry]) -> Result<()> {
     let text = memory::render_document(entries);
     ensure_memory_file(loc)?; // dir + .gitignore (+ seed if absent)
-    match loc {
-        RepoLoc::Local(root) => {
-            let file = root.join(MEMORY_DIR).join(MEMORY_FILE);
-            std::fs::write(&file, text).with_context(|| format!("writing {}", file.display()))
-        }
-        RepoLoc::Remote(_) => write_remote_file(loc, &memory_abs(loc), &text),
-    }
-}
-
-/// Filename of a remote project's synced pane layout, under `<root>/.muxel/`.
-const REMOTE_LAYOUT_FILE: &str = "workspace.json";
-/// One-level backup of the previous layout, written before each overwrite.
-const REMOTE_LAYOUT_BAK: &str = "workspace.bak.json";
-
-/// Absolute path of the synced layout file on the remote host.
-fn remote_layout_abs(root: &str) -> String {
-    format!(
-        "{}/{MEMORY_DIR}/{REMOTE_LAYOUT_FILE}",
-        root.trim_end_matches('/')
-    )
-}
-
-/// Path of the synced layout file inside a local project root.
-fn local_layout_abs(root: &Path) -> PathBuf {
-    root.join(MEMORY_DIR).join(REMOTE_LAYOUT_FILE)
-}
-
-/// Write the layout JSON to `<root>/.muxel/workspace.json` on the local filesystem,
-/// backing up any current copy to `workspace.bak.json` and git-ignoring `.muxel/`.
-/// The local-project mirror of the remote push, so an SSH peer (the iOS app) can
-/// read a local project's panes.
-fn push_local_layout(root: &Path, json: &str) -> Result<()> {
-    let dir = root.join(MEMORY_DIR);
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let file = dir.join(REMOTE_LAYOUT_FILE);
-    if file.exists() {
-        let _ = std::fs::copy(&file, dir.join(REMOTE_LAYOUT_BAK));
-    }
-    let _ = ensure_gitignored(root, &format!("{MEMORY_DIR}/"));
-    std::fs::write(&file, json).with_context(|| format!("writing {}", file.display()))
-}
-
-/// The shell command that prepares the remote for a layout push: ensure
-/// `<root>/.muxel/` exists, back up any current `workspace.json` to
-/// `workspace.bak.json`, and git-ignore `.muxel/`. Pure (no I/O) so its shape is
-/// unit-testable; mirrors `ensure_memory_file`'s remote branch.
-fn remote_push_prep_cmd(os: RemoteOs, root: &str) -> String {
-    let rel = format!("{MEMORY_DIR}/{REMOTE_LAYOUT_FILE}");
-    let bak = format!("{MEMORY_DIR}/{REMOTE_LAYOUT_BAK}");
-    let ignore_line = format!("{MEMORY_DIR}/");
-    remote_ops::push_prep(os, root, MEMORY_DIR, &rel, &bak, &ignore_line)
-}
-
-/// Read a project's synced layout JSON (`<root>/.muxel/workspace.json`) — over SSH
-/// for a remote project, or from the local filesystem for a local one. `None` if
-/// missing, oversized, or unreadable.
-pub fn fetch_remote_layout(loc: &RepoLoc) -> Option<String> {
-    match loc {
-        RepoLoc::Remote(c) => read_remote_file(loc, &remote_layout_abs(&c.remote_path)),
-        RepoLoc::Local(root) => {
-            let path = local_layout_abs(root);
-            if std::fs::metadata(&path).ok()?.len() > MAX_REMOTE_BYTES {
-                return None;
-            }
-            std::fs::read_to_string(&path).ok()
-        }
-    }
-}
-
-/// Push the project's pane-layout JSON to `<root>/.muxel/workspace.json`, backing up
-/// the previous copy to `workspace.bak.json` first and ensuring `.muxel/` is
-/// git-ignored — over SSH for a remote project, on the local filesystem for a local
-/// one. `json` is produced by `muxel_core::RemoteLayout::to_json`.
-pub fn push_remote_layout(loc: &RepoLoc, json: &str) -> Result<()> {
-    let c = match loc {
-        RepoLoc::Remote(c) => c,
-        RepoLoc::Local(root) => return push_local_layout(root, json),
-    };
-    let root = c.remote_path.trim_end_matches('/');
-    let out = remote_ssh_command(c, remote_push_prep_cmd(c.host.os, root))
-        .output()
-        .map_err(|e| ssh_spawn_error(c.host.auth, e))?;
-    if !out.status.success() {
-        let msg = String::from_utf8_lossy(&out.stderr);
-        let msg = msg.trim();
-        bail!(
-            "{}",
-            if msg.is_empty() {
-                "prepare remote layout failed"
-            } else {
-                msg
-            }
-        );
-    }
-    write_remote_file(loc, &remote_layout_abs(root), json)
+    let file = memory_abs(loc);
+    std::fs::write(&file, text).with_context(|| format!("writing {}", file.display()))
 }
 
 /// `git <args>` at `loc`; trimmed single-line stdout on success, else `None`.
@@ -536,261 +198,6 @@ fn git_run_loc(loc: &RepoLoc, args: &[&str]) -> Result<String> {
     } else {
         summary.to_string()
     })
-}
-
-/// Run a one-off command on a remote host over SSH, reusing/establishing the
-/// host's ControlMaster. `ConnectTimeout` + `BatchMode` (non-password) make it
-/// fail fast instead of blocking on a prompt; password auth feeds `sshpass` via
-/// `$SSHPASS`. `remote_cmd` is a single shell command string (already quoted).
-fn ssh_exec(
-    host: &RemoteHost,
-    control_path: &str,
-    password: Option<&str>,
-    remote_cmd: &str,
-) -> Result<()> {
-    let out = ssh_run(host, control_path, password, remote_cmd)?;
-    if out.status.success() {
-        return Ok(());
-    }
-    bail!("{}", ssh_error_message(&out));
-}
-
-/// Run `remote_cmd` over ssh and return its raw output. Lower level than
-/// [`ssh_exec`]: callers inspect the exit status themselves (e.g. to tell an ssh
-/// transport failure apart from the remote command exiting non-zero).
-fn ssh_run(
-    host: &RemoteHost,
-    control_path: &str,
-    password: Option<&str>,
-    remote_cmd: &str,
-) -> Result<std::process::Output> {
-    let mut argv = ssh::connection_args(host, control_path);
-    // `ConnectTimeout` comes from `base_args`; `BatchMode` (non-password) fails
-    // fast instead of blocking on a password prompt to a non-tty.
-    if password.is_none() {
-        argv.push("-o".into());
-        argv.push("BatchMode=yes".into());
-    }
-    argv.push(ssh::target(host));
-    argv.push("--".into());
-    argv.push(remote_cmd.to_string());
-
-    let mut cmd;
-    if host.auth == SshAuth::Password {
-        cmd = command("sshpass");
-        cmd.arg("-e").arg("ssh").args(&argv);
-        if let Some(pw) = password {
-            cmd.env("SSHPASS", pw);
-        }
-    } else {
-        cmd = command("ssh");
-        cmd.args(&argv);
-    }
-    cmd.output().map_err(|e| ssh_spawn_error(host.auth, e))
-}
-
-/// A human message for an ssh transport/auth failure: ssh's stderr, or a generic
-/// line when ssh said nothing.
-fn ssh_error_message(out: &std::process::Output) -> String {
-    let err = String::from_utf8_lossy(&out.stderr);
-    let msg = err.trim();
-    if msg.is_empty() {
-        "connection failed".to_string()
-    } else {
-        msg.to_string()
-    }
-}
-
-/// Whether a non-zero ssh run was ssh's own *transport/auth* failure rather than
-/// the remote command exiting non-zero. ssh uses exit code 255 for its own errors
-/// and otherwise passes the remote command's status through; `sshpass` uses 2..=6
-/// for its auth failures (a passed-through command status — e.g. 1 from `test` —
-/// is the command's own code, so it must NOT be treated as a connection failure).
-fn is_ssh_transport_failure(auth: SshAuth, code: Option<i32>) -> bool {
-    match code {
-        Some(255) => true,
-        Some(c) if auth == SshAuth::Password && (2..=6).contains(&c) => true,
-        _ => false,
-    }
-}
-
-/// Scan a remote host for muxel projects: `find $HOME` for the
-/// `.muxel/workspace.json` markers muxel writes on sync, returning the deduped,
-/// sorted project roots. Depth-capped and heavy dirs pruned so it's quick over a
-/// one-shot exec channel — the desktop port of the iOS `ProjectDiscovery` scan. A
-/// non-zero `find` (unreadable dirs) is fine; only an ssh transport/auth failure is
-/// surfaced as an error.
-pub fn scan_remote_projects(
-    host: &RemoteHost,
-    control_path: &str,
-    password: Option<&str>,
-) -> Result<Vec<String>> {
-    const MARKER: &str = "/.muxel/workspace.json";
-    /// Directories never worth descending into, on either OS: big, and never a
-    /// project root muxel put a marker in.
-    const PRUNE: &[&str] = &[
-        "node_modules",
-        ".git",
-        ".cache",
-        ".cargo",
-        ".rustup",
-        ".npm",
-        "target",
-        "vendor",
-        "Library",
-        ".Trash",
-    ];
-    let cmd = remote_ops::scan_projects(host.os, MARKER, 7, PRUNE);
-    let out = ssh_run(host, control_path, password, &cmd)?;
-    if !out.status.success() && is_ssh_transport_failure(host.auth, out.status.code()) {
-        bail!("{}", ssh_error_message(&out));
-    }
-    let mut roots: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|l| l.ends_with(MARKER))
-        .map(|l| l[..l.len() - MARKER.len()].to_string())
-        .filter(|r| !r.is_empty())
-        .collect();
-    roots.sort();
-    roots.dedup();
-    Ok(roots)
-}
-
-/// Map an ssh/sshpass spawn failure to an actionable message: a missing
-/// `sshpass` (saved-password auth, Unix-only) or a missing `ssh`.
-fn ssh_spawn_error(auth: SshAuth, e: std::io::Error) -> anyhow::Error {
-    if e.kind() == std::io::ErrorKind::NotFound {
-        if auth == SshAuth::Password {
-            anyhow::anyhow!(
-                "`sshpass` not found — it's required for saved-password auth and is \
-                 Linux/macOS only. Install it, or use a key file / ssh-agent instead."
-            )
-        } else {
-            anyhow::anyhow!("`ssh` not found on PATH")
-        }
-    } else {
-        anyhow::Error::new(e).context("running ssh")
-    }
-}
-
-/// Verify a host's SSH config by opening a quick connection (`ssh … -- true`).
-/// Also establishes the ControlMaster so a subsequent pane connects instantly.
-pub fn ssh_check(host: &RemoteHost, control_path: &str, password: Option<&str>) -> Result<()> {
-    ssh_exec(host, control_path, password, "true")
-}
-
-/// Verify a host's *credentials* with a **fresh** connection. Unlike [`ssh_check`]
-/// it never reuses the ControlMaster (a warm socket would otherwise let any
-/// password "succeed"), and for password auth it forces password authentication
-/// so a working key can't mask a wrong password. Returns the ssh error (e.g.
-/// "Permission denied") on failure.
-pub fn ssh_verify(host: &RemoteHost, password: Option<&str>) -> Result<()> {
-    let mut argv = ssh::base_args(host); // includes ConnectTimeout
-    argv.push("-o".into());
-    argv.push("ControlPath=none".into()); // never multiplex a credential test
-    argv.push("-o".into());
-    argv.push("NumberOfPasswordPrompts=1".into());
-    if host.auth == SshAuth::Password {
-        // Force password auth so a working key can't make a bad password pass.
-        argv.push("-o".into());
-        argv.push("PreferredAuthentications=password".into());
-        argv.push("-o".into());
-        argv.push("PubkeyAuthentication=no".into());
-    } else {
-        // No password to type → fail fast instead of blocking on a prompt.
-        argv.push("-o".into());
-        argv.push("BatchMode=yes".into());
-    }
-    argv.push(ssh::target(host));
-    argv.push("--".into());
-    argv.push("true".into());
-
-    let mut cmd;
-    if host.auth == SshAuth::Password {
-        cmd = command("sshpass");
-        cmd.arg("-e").arg("ssh").args(&argv);
-        if let Some(pw) = password {
-            cmd.env("SSHPASS", pw);
-        }
-    } else {
-        cmd = command("ssh");
-        cmd.args(&argv);
-    }
-    let out = cmd.output().map_err(|e| ssh_spawn_error(host.auth, e))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let msg = err.trim();
-        let msg = if msg.is_empty() {
-            "connection failed"
-        } else {
-            msg
-        };
-        bail!("{msg}");
-    }
-    Ok(())
-}
-
-/// Check that `dir` exists (and is a directory) on the remote host.
-pub fn ssh_test_dir(
-    host: &RemoteHost,
-    control_path: &str,
-    password: Option<&str>,
-    dir: &str,
-) -> Result<()> {
-    let out = ssh_run(
-        host,
-        control_path,
-        password,
-        &remote_ops::test_dir(host.os, dir),
-    )?;
-    if out.status.success() {
-        return Ok(());
-    }
-    // ssh connected fine but `test -d` failed → it's the PATH, not the link.
-    // A genuine ssh transport/auth failure keeps the connection message instead.
-    if is_ssh_transport_failure(host.auth, out.status.code()) {
-        bail!("{}", ssh_error_message(&out));
-    }
-    bail!("directory not found: {dir}");
-}
-
-/// Remove a host's stale known_hosts entry (`ssh-keygen [-f <file>] -R <entry>`)
-/// — the accept path of the changed-host-key dialog. `entry` is the token ssh
-/// itself reported (`example.com`, `[example.com]:2222`, or a config alias);
-/// ssh-keygen handles hashed entries itself and backs the file up to
-/// `known_hosts.old`. The reconnect then re-pins the new key via `accept-new`.
-pub fn forget_host_key(entry: &str, file: Option<&str>) -> Result<()> {
-    let out = command("ssh-keygen")
-        .args(ssh::keygen_remove_args(entry, file))
-        .output()
-        .context("run ssh-keygen")?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let msg = err.trim();
-        bail!(
-            "{}",
-            if msg.is_empty() {
-                "ssh-keygen -R failed"
-            } else {
-                msg
-            }
-        );
-    }
-    Ok(())
-}
-
-/// The stored known_hosts fingerprints for a host (`ssh-keygen -l -F <entry>`),
-/// as `(key type, fingerprint)` pairs — shown as "Stored" in the changed-key
-/// dialog. Best-effort: empty on any failure (the dialog says "not found").
-pub fn stored_host_key_fingerprints(entry: &str, file: Option<&str>) -> Vec<(String, String)> {
-    command("ssh-keygen")
-        .args(ssh::keygen_find_args(entry, file))
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| ssh::parse_keygen_lookup(&String::from_utf8_lossy(&o.stdout)))
-        .unwrap_or_default()
 }
 
 /// Whether `path` is inside a git working tree.
@@ -851,7 +258,7 @@ pub fn repo_head(repo: &Path) -> Option<String> {
 }
 
 /// The repo's current branch name (e.g. `main`); `None` when detached (`"HEAD"`)
-/// or git fails. Used only for display. Works for local or remote repos.
+/// or git fails. Used only for display.
 pub fn repo_current_branch(loc: &RepoLoc) -> Option<String> {
     git_line_loc(loc, &["rev-parse", "--abbrev-ref", "HEAD"]).filter(|b| b != "HEAD")
 }
@@ -930,7 +337,7 @@ pub fn git_commit(loc: &RepoLoc, msg: &str) -> Result<String> {
 }
 
 /// Stage `paths` (`git add -- <paths>`), relative to the repo root. A directory
-/// stages everything under it. Works local or remote.
+/// stages everything under it.
 pub fn git_add_paths(loc: &RepoLoc, paths: &[String]) -> Result<()> {
     let mut args: Vec<&str> = vec!["add", "--"];
     args.extend(paths.iter().map(String::as_str));
@@ -989,7 +396,7 @@ fn parse_status_z(bytes: &[u8]) -> Vec<GitChange> {
 /// `path` is the repo-relative path from [`git_status_files`]. For a brand-new
 /// staged file (empty `diff HEAD`) it falls back to the staged (`--cached`) diff.
 /// Returns display-ready diff text, truncated at [`MAX_DIFF_BYTES`], or a short
-/// message when there's nothing to show. Works for local and remote `loc`.
+/// message when there's nothing to show.
 pub fn git_diff_for(loc: &RepoLoc, path: &str) -> String {
     let run = |args: &[&str]| {
         git_output(loc, args)
@@ -1042,7 +449,7 @@ pub fn git_discard_path(loc: &RepoLoc, path: &str) -> Result<String> {
 }
 
 /// Merge `branch` into whatever is checked out at `loc` (the base). `RepoLoc`
-/// (local + remote) variant of [`merge_worktree_branch`]; aborts a failed merge
+/// variant of [`merge_worktree_branch`]; aborts a failed merge
 /// so the repo isn't left mid-merge.
 pub fn merge_branch(loc: &RepoLoc, branch: &str) -> Result<String> {
     let out = git_output(loc, &["merge", "--no-edit", branch]).context("running `git merge`")?;
@@ -1054,7 +461,7 @@ pub fn merge_branch(loc: &RepoLoc, branch: &str) -> Result<String> {
 }
 
 /// Remove the worktree at `worktree_path` (force) and prune stale entries, at
-/// `loc`. `RepoLoc` (local + remote) variant of [`remove_worktree`].
+/// `loc`. `RepoLoc` variant of [`remove_worktree`].
 pub fn remove_worktree_loc(loc: &RepoLoc, worktree_path: &str) -> Result<String> {
     let out = git_output(loc, &["worktree", "remove", "--force", worktree_path])
         .context("running `git worktree remove`")?;
@@ -1068,7 +475,7 @@ pub fn remove_worktree_loc(loc: &RepoLoc, worktree_path: &str) -> Result<String>
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Delete `branch` (force, `git branch -D`) at `loc`. `RepoLoc` (local + remote)
+/// Delete `branch` (force, `git branch -D`) at `loc`. `RepoLoc`
 /// variant of [`delete_branch`].
 pub fn delete_branch_loc(loc: &RepoLoc, branch: &str) -> Result<String> {
     git_run_loc(loc, &["branch", "-D", branch])
@@ -1300,154 +707,10 @@ pub fn tmux_session_exists(session: &str) -> bool {
 
 /// The last `lines` lines of a local tmux session's pane, scrollback included
 /// (see [`muxel_core::tmux::capture_pane_args`]). `None` when tmux can't say.
-pub fn tmux_capture(session: &str, lines: usize) -> Option<String> {
-    let out = command("tmux")
-        .args(muxel_core::tmux::capture_pane_args(session, lines))
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// Run `tmux <args>` where a project's sessions live: on this machine, or on its
-/// SSH host (reusing the host's ControlMaster). `None` for a Windows host, which
-/// has no tmux.
-fn tmux_at(loc: &RepoLoc, args: &[String]) -> Option<std::process::Output> {
-    match loc {
-        RepoLoc::Local(_) => command("tmux")
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .output()
-            .ok(),
-        RepoLoc::Remote(c) => {
-            if c.host.os.is_windows() {
-                return None;
-            }
-            let cmd = std::iter::once("tmux".to_string())
-                .chain(args.iter().map(|a| ssh::sh_quote(a)))
-                .collect::<Vec<_>>()
-                .join(" ");
-            remote_ssh_command(c, format!("{}; {cmd}", ssh::tmux_path_prelude()))
-                .stdin(std::process::Stdio::null())
-                .output()
-                .ok()
-        }
-    }
-}
-
-/// Run this muxel's own `ctl` command (`exe ctl <args>`), the way an outside
-/// agent does — Settings → Grok Bot's Test.
-pub fn run_muxel_ctl(exe: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
-    command(exe)
-        .arg("ctl")
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
-}
-
-/// A tmux session's user option (`@name`), wherever the session lives. `None`
-/// when it is unset, the session is gone, or tmux couldn't be reached.
-pub fn tmux_option(loc: &RepoLoc, session: &str, option: &str) -> Option<String> {
-    let out = tmux_at(loc, &muxel_core::tmux::show_option_args(session, option))?;
-    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (out.status.success() && !value.is_empty()).then_some(value)
-}
-
-/// Set a tmux session's user option (`@name`), wherever the session lives.
-pub fn set_tmux_option(loc: &RepoLoc, session: &str, option: &str, value: &str) -> Result<()> {
-    let args = muxel_core::tmux::set_option_args(session, option, value);
-    let Some(out) = tmux_at(loc, &args) else {
-        bail!("tmux isn't reachable for session “{session}”");
-    };
-    if !out.status.success() {
-        bail!(
-            "tmux set-option failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-/// Kill a tmux session. Best-effort.
 pub fn kill_tmux_session(session: &str) {
     let _ = command("tmux")
         .args(muxel_core::tmux::kill_session_args(session))
         .output();
-}
-
-/// Kill a tmux session on a remote host over SSH, and **confirm it is gone**
-/// (reuses the host's ControlMaster, which is still alive right after the pane's
-/// ssh closed).
-///
-/// `Ok(())` means the host answered and no longer has the session. An `Err` says
-/// "could not confirm" — the session may well still be running — and the caller is
-/// expected to try again rather than treat the teardown as finished. See
-/// [`ssh::kill_and_confirm_command`] for why a bare `kill-session` can't answer
-/// that question.
-pub fn kill_remote_tmux(
-    host: &RemoteHost,
-    control_path: &str,
-    password: Option<&str>,
-    session: &str,
-) -> Result<()> {
-    let out = ssh_run(
-        host,
-        control_path,
-        password,
-        &ssh::kill_and_confirm_command(session),
-    )?;
-    match out.status.code() {
-        Some(0) => Ok(()),
-        Some(ssh::TMUX_STILL_ALIVE) => {
-            bail!("tmux session “{session}” is still running on {}", host.name)
-        }
-        Some(ssh::TMUX_MISSING) => bail!("no tmux on {}", host.name),
-        _ => bail!("{}", ssh_error_message(&out)),
-    }
-}
-
-/// Fire-and-forget kill of a remote tmux session, for quit-time cleanup: the
-/// spawned ssh child (reusing the warm ControlMaster) outlives muxel, so
-/// quitting is never blocked on the network. Errors are ignored.
-pub fn kill_remote_tmux_detached(
-    host: &RemoteHost,
-    control_path: &str,
-    password: Option<&str>,
-    session: &str,
-) {
-    let target = format!("={session}"); // exact-match target, as in kill_session_args
-    let remote_cmd = format!(
-        "{}; tmux kill-session -t {}",
-        ssh::tmux_path_prelude(),
-        ssh::sh_quote(&target)
-    );
-    let mut argv = ssh::connection_args(host, control_path);
-    if password.is_none() {
-        argv.push("-o".into());
-        argv.push("BatchMode=yes".into());
-    }
-    argv.push(ssh::target(host));
-    argv.push("--".into());
-    argv.push(remote_cmd);
-    let mut cmd;
-    if host.auth == SshAuth::Password {
-        cmd = command("sshpass");
-        cmd.arg("-e").arg("ssh").args(&argv);
-        if let Some(pw) = password {
-            cmd.env("SSHPASS", pw);
-        }
-    } else {
-        cmd = command("ssh");
-        cmd.args(&argv);
-    }
-    let _ = cmd
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
 }
 
 /// Fire-and-forget kill of a local tmux session (quit-time cleanup).
@@ -1478,24 +741,6 @@ pub fn reveal_in_file_manager(path: &Path) {
         };
         let _ = command("xdg-open").arg(dir).output();
     }
-}
-
-/// Whether this OS has a per-app microphone permission screen worth offering to
-/// open. Linux has none (PipeWire/ALSA don't gate per app outside a Flatpak
-/// portal), so callers hide the shortcut there rather than open something useless.
-pub const HAS_MICROPHONE_SETTINGS: bool = cfg!(any(target_os = "macos", target_os = "windows"));
-
-/// Open the OS microphone privacy settings. Best-effort; no-op where
-/// [`HAS_MICROPHONE_SETTINGS`] is false.
-pub fn open_microphone_settings() {
-    #[cfg(target_os = "macos")]
-    let _ = command("open")
-        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
-        .output();
-    #[cfg(target_os = "windows")]
-    let _ = command("cmd")
-        .args(["/C", "start", "ms-settings:privacy-microphone"])
-        .output();
 }
 
 /// Local branch names (e.g. `["main", "feature/x"]`) at `loc`.
@@ -1556,21 +801,6 @@ pub fn git_stash_drop(loc: &RepoLoc) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn transport_failure_vs_command_failure() {
-        // ssh's own transport/auth error (255) is a connection failure.
-        assert!(is_ssh_transport_failure(SshAuth::Agent, Some(255)));
-        assert!(is_ssh_transport_failure(SshAuth::Password, Some(255)));
-        // sshpass auth failure (e.g. wrong password = 5) is too.
-        assert!(is_ssh_transport_failure(SshAuth::Password, Some(5)));
-        // A remote command exiting non-zero (e.g. `test -d` = 1 for a missing
-        // dir) is NOT a connection failure — it's a path problem.
-        assert!(!is_ssh_transport_failure(SshAuth::Key, Some(1)));
-        assert!(!is_ssh_transport_failure(SshAuth::Password, Some(1)));
-        // sshpass codes 2..=6 only apply to password auth, not key/agent.
-        assert!(!is_ssh_transport_failure(SshAuth::Key, Some(5)));
-    }
 
     #[test]
     fn worktree_create_and_remove() {
@@ -1741,7 +971,7 @@ mod tests {
         // Pre-existing .gitignore without our entry.
         std::fs::write(root.join(".gitignore"), "target\n").unwrap();
 
-        ensure_memory_file(&RepoLoc::Local(root.clone())).expect("ensure memory");
+        ensure_memory_file(&RepoLoc::new(root.clone())).expect("ensure memory");
 
         let mem = root.join(MEMORY_DIR).join(MEMORY_FILE);
         assert!(mem.exists(), "MEMORY.md should be created");
@@ -1751,87 +981,12 @@ mod tests {
 
         // Idempotent: a second call doesn't duplicate the gitignore line or clobber.
         std::fs::write(&mem, "kept user notes").unwrap();
-        ensure_memory_file(&RepoLoc::Local(root.clone())).expect("ensure memory again");
+        ensure_memory_file(&RepoLoc::new(root.clone())).expect("ensure memory again");
         let gi2 = std::fs::read_to_string(root.join(".gitignore")).unwrap();
         assert_eq!(gi2.matches(".muxel/").count(), 1, "no duplicate ignore");
         assert_eq!(std::fs::read_to_string(&mem).unwrap(), "kept user notes");
 
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn local_layout_push_fetch_roundtrip() {
-        let root = std::env::temp_dir().join("muxel-it-local-layout");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let loc = RepoLoc::Local(root.clone());
-
-        // Nothing synced yet.
-        assert!(fetch_remote_layout(&loc).is_none());
-
-        // Push writes <root>/.muxel/workspace.json and git-ignores .muxel/.
-        push_remote_layout(&loc, "{\"v\":1}").expect("push local layout");
-        assert_eq!(fetch_remote_layout(&loc).as_deref(), Some("{\"v\":1}"));
-        let gi = std::fs::read_to_string(root.join(".gitignore")).unwrap();
-        assert!(
-            gi.lines().any(|l| l.trim() == ".muxel/"),
-            "gitignored: {gi}"
-        );
-
-        // A second push backs up the previous copy to workspace.bak.json.
-        push_remote_layout(&loc, "{\"v\":2}").expect("push again");
-        assert_eq!(fetch_remote_layout(&loc).as_deref(), Some("{\"v\":2}"));
-        let bak =
-            std::fs::read_to_string(root.join(MEMORY_DIR).join("workspace.bak.json")).unwrap();
-        assert_eq!(bak, "{\"v\":1}", "previous copy backed up");
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn remote_push_prep_cmd_backs_up_and_gitignores() {
-        // `sh_quote` leaves quote-safe tokens (paths, `.muxel/`) bare.
-        let cmd = remote_push_prep_cmd(RemoteOs::Unix, "/srv/app/");
-        // cd into the (trailing-slash-trimmed) root and create the dir.
-        assert!(cmd.contains("cd /srv/app "), "cd into root: {cmd}");
-        assert!(cmd.contains("mkdir -p .muxel "), "make .muxel: {cmd}");
-        // Back up the previous layout before it's overwritten.
-        assert!(
-            cmd.contains("cp -f .muxel/workspace.json .muxel/workspace.bak.json"),
-            "backup prior layout: {cmd}"
-        );
-        // Idempotently git-ignore .muxel/.
-        assert!(
-            cmd.contains("grep -qxF .muxel/ .gitignore"),
-            "gitignore: {cmd}"
-        );
-        assert!(cmd.contains(">> .gitignore"), "appends ignore: {cmd}");
-    }
-
-    /// The same preparation on a Windows host goes out as one opaque encoded
-    /// command, so the far side's `DefaultShell` cannot reinterpret any of it.
-    #[test]
-    fn remote_push_prep_cmd_is_encoded_for_windows() {
-        let cmd = remote_push_prep_cmd(RemoteOs::Windows, "C:/src/app/");
-        assert!(
-            cmd.starts_with("powershell.exe -NoProfile -NonInteractive -EncodedCommand "),
-            "{cmd}"
-        );
-        let payload = cmd.rsplit(' ').next().unwrap();
-        assert!(
-            payload
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='),
-            "payload is not bare base64: {payload}"
-        );
-    }
-
-    #[test]
-    fn remote_layout_abs_joins_under_dot_muxel() {
-        assert_eq!(
-            remote_layout_abs("/home/me/proj/"),
-            "/home/me/proj/.muxel/workspace.json"
-        );
     }
 
     #[test]
@@ -1889,7 +1044,7 @@ mod tests {
         std::fs::write(repo.join("wanted.txt"), "new\n").unwrap();
         std::fs::write(repo.join("extra.txt"), "junk\n").unwrap();
 
-        let loc = RepoLoc::Local(repo.clone());
+        let loc = RepoLoc::new(repo.clone());
 
         // status lists every changed + untracked file.
         let listed: std::collections::BTreeSet<String> =
@@ -1958,7 +1113,7 @@ mod tests {
         std::fs::write(repo.join("a.txt"), "one\n").unwrap();
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "init"]);
-        let loc = RepoLoc::Local(repo.clone());
+        let loc = RepoLoc::new(repo.clone());
 
         // Modify the file: its single-file diff shows the change.
         std::fs::write(repo.join("a.txt"), "two\n").unwrap();

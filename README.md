@@ -1,5 +1,13 @@
 
 
+# muxel
+
+muxel is an Agent Development Environment (ADE) — a native desktop terminal multiplexer for running several coding agents side by side. It gives you a tiled, tabbed workspace where each pane embeds a real terminal: run Claude Code, opencode, Amp, or plain shells in parallel, track agent status at a glance, and get notified when an agent finishes or needs input.
+
+It's built for driving multiple agents across git worktrees — one window per branch, no tmux keybindings required. See [FEATURES.md](FEATURES.md) for the full feature catalogue.
+
+---
+
 - **Credits** - I want to give credits to the original Muxel developers for making this ADE that allow people to build off of.
 
 ## License

@@ -8,7 +8,7 @@ use crate::editor::{
 };
 use crate::i18n::{t, tf, tn};
 use crate::integrations;
-use crate::settings_view::{self, RemoteTestState, SettingsSection, SettingsUi};
+use crate::settings_view::{self, SettingsSection, SettingsUi};
 use crate::split::{h_resizable, resizable_panel, v_resizable};
 use crate::theme;
 use crate::ui_profile;
@@ -23,17 +23,15 @@ use gpui_component::text::markdown;
 use gpui_component::{button::*, *};
 use muxel_core::autopilot::{self, AutoAction, AutoContinue, PaneActivity};
 use muxel_core::memory::{self, MemoryEntry};
-use muxel_core::winshell::WindowsShell;
 use muxel_core::{
-    AgentActivity, AgentActivityState, AgentPreset, FocusDir, Identity, InjectionMode, Instance,
+    AgentActivity, AgentActivityState, AgentPreset, FocusDir, InjectionMode, Instance,
     InstanceKind, Loop, LoopSchedule, MEMORY_DIR, MEMORY_FILE, PaneNode, PostRunAction, Project,
-    RemoteHost, RemoteLayout, RemoteOs, RemoteRef, ResolvedLaunch, Runner, Snippet, SplitDirection,
-    SshAuth, StartupAgent, Workspace, WorkspaceMeta, WorkspacesIndex, Worktree, add_tab,
-    add_tab_at, agent_activity_label, append_agent_instruction,
-    codex_developer_instructions_override, file_link_instruction, focus_in_direction,
+    ResolvedLaunch, Runner, Snippet, SplitDirection, StartupAgent, Workspace, WorkspaceMeta,
+    WorkspacesIndex, Worktree, add_tab, add_tab_at, agent_activity_label, append_agent_instruction,
+    codex_developer_instructions_override, focus_in_direction,
     memory_instruction, memory_reference, migrate_worktrees, move_into_split, move_into_tabs,
     move_pane_beside, move_tab_to, remove, resolve_launch_for_session, set_active_tab,
-    set_split_sizes, set_tab_order, split, split_beside, ssh, swap_instances, swap_panes,
+    set_split_sizes, set_tab_order, split, split_beside, swap_instances, swap_panes,
     sync_agent_injection_modes, sync_codex_approval_args,
 };
 use muxel_terminal::{
@@ -45,8 +43,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
-
-mod control_api;
 
 /// Minimum width a horizontal split's pane can shrink to (~40 cols), so agent
 /// TUIs (Claude/opencode/…) don't get squished narrow enough to overflow.
@@ -154,12 +150,6 @@ mod maximize_follow_tests {
         assert_eq!(maximize_after_select(Some(max), true, max, true), Some(max));
     }
 }
-
-/// How long to wait before each attempt at killing a closed pane's remote tmux
-/// session (the first is immediate). Short enough that a blip or a control socket
-/// that died with the pane's own ssh is ridden out within the minute; anything
-/// longer-lived is left to the next connect — see `MuxelApp::reap_remote_session`.
-const RETRY_REMOTE_KILL_SECS: [u64; 4] = [0, 3, 10, 30];
 
 const RESTORE_LAUNCH_CONCURRENCY: usize = 4;
 const RESTORE_FIRST_WAVE_DEBOUNCE_MS: u64 = 250;
@@ -692,6 +682,14 @@ fn localized_activity_label(status: AgentStatus, activity: &AgentActivity, now: 
     age.map_or(word.clone(), |age| format!("{word} · {age}"))
 }
 
+/// Current unix time in seconds (0 if the clock is somehow before the epoch).
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Asset path for an agent's icon, chosen from its program name.
 fn agent_icon_path(program: Option<&str>) -> SharedString {
     let base = program.map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p));
@@ -1222,11 +1220,6 @@ struct SetPreset(Uuid);
 #[action(namespace = muxel, no_json)]
 struct SetDefaultPreset(Uuid);
 
-/// Pick the OS voice read-aloud speaks with (by name; empty = the OS default).
-#[derive(Action, Clone, PartialEq)]
-#[action(namespace = muxel, no_json)]
-struct SetSystemVoice(String);
-
 /// Register global action handlers that route to the running app. Called once
 /// at startup (the app installs [`MuxelHandle`] when it is created).
 pub fn register_actions(cx: &mut App) {
@@ -1254,15 +1247,6 @@ pub fn register_actions(cx: &mut App) {
         };
         if let Some(app) = weak.upgrade() {
             app.update(cx, |this, cx| this.set_theme(a.0.clone(), cx));
-        }
-    });
-    // Voice picks come from the Read Aloud settings dropdown, same routing.
-    cx.on_action(|a: &SetSystemVoice, cx| {
-        let Some(weak) = cx.try_global::<MuxelHandle>().map(|h| h.0.clone()) else {
-            return;
-        };
-        if let Some(app) = weak.upgrade() {
-            app.update(cx, |this, cx| this.set_system_voice(a.0.clone(), cx));
         }
     });
     // Language picks come from the settings dropdown (overlay menu → global
@@ -1295,7 +1279,6 @@ pub fn register_actions(cx: &mut App) {
                     cx.quit();
                 } else {
                     this.quit_kill_tmux_local = false;
-                    this.quit_kill_tmux_remote = false;
                     this.show_quit_confirm = true;
                     cx.notify();
                 }
@@ -1344,16 +1327,6 @@ actions!(
         ShowKeys,
         // Toggle the broadcast bar (send one line to every agent in the project).
         ToggleBroadcast,
-        // Toggle speech-to-text dictation into the focused agent.
-        ToggleSpeechToText,
-        // Push-to-hold dictation: records while the chord is held.
-        HoldSpeechToText,
-        // Read the focused agent's last reply aloud; again pauses, again resumes.
-        ReadAloud,
-        // Start the focused pane's reading over from the beginning.
-        ReadAloudRestart,
-        // Stop reading aloud (and forget where it was).
-        ReadAloudStop,
         // Toggle the "new agents get a git worktree" toolbar switch.
         ToggleWorktree,
         // OS fullscreen with the sidebar hidden (a floating pill reveals it).
@@ -1416,11 +1389,6 @@ fn keybinding_for(action: &str, keystroke: &str, context: Option<&str>) -> Optio
         "FocusDown" => KeyBinding::new(keystroke, FocusDown, context),
         "ShowKeys" => KeyBinding::new(keystroke, ShowKeys, context),
         "ToggleBroadcast" => KeyBinding::new(keystroke, ToggleBroadcast, context),
-        "ToggleSpeechToText" => KeyBinding::new(keystroke, ToggleSpeechToText, context),
-        "HoldSpeechToText" => KeyBinding::new(keystroke, HoldSpeechToText, context),
-        "ReadAloud" => KeyBinding::new(keystroke, ReadAloud, context),
-        "ReadAloudRestart" => KeyBinding::new(keystroke, ReadAloudRestart, context),
-        "ReadAloudStop" => KeyBinding::new(keystroke, ReadAloudStop, context),
         "ToggleWorktree" => KeyBinding::new(keystroke, ToggleWorktree, context),
         "ToggleFullScreen" => KeyBinding::new(keystroke, ToggleFullScreen, context),
         "ToggleDevConsole" => KeyBinding::new(keystroke, ToggleDevConsole, context),
@@ -2052,300 +2020,6 @@ struct SettingsSnapshot {
     notifications: bool,
 }
 
-/// State of the in-app updater (drives the title-bar button + update modal).
-enum UpdateState {
-    /// No check has run yet this session.
-    Idle,
-    /// A check is in flight.
-    Checking,
-    /// Checked and already on the latest release.
-    UpToDate,
-    /// A newer release is available.
-    Available(crate::update::UpdateInfo),
-    /// The new version is downloading/being applied.
-    Downloading,
-    /// The update is staged; restart to finish.
-    Ready(crate::update::RelaunchPlan),
-    /// The last check or download failed.
-    Error(String),
-}
-
-// --- Wake sequence ---------------------------------------------------------
-// The sweep walks the panes themselves — nothing is drawn over the workspace, so
-// what you watch is the real thing coming back. The pacing below is the whole
-// effect: a sweep fast enough to be efficient would just look like a glitch.
-
-/// How long the sweep dwells on each pane before moving to the next.
-const WAKE_STEP: Duration = Duration::from_millis(400);
-
-/// The wake command's report, once every pane has been visited.
-fn wake_report(relaunched: usize) -> String {
-    if relaunched == 0 {
-        t("Every agent was already running").to_string()
-    } else {
-        tn(
-            "Relaunched {n} agent",
-            "Relaunched {n} agents",
-            relaunched,
-            &[("n", &relaunched.to_string())],
-        )
-    }
-}
-
-/// State of a speech-to-text dictation (drives the mic button + recording pill).
-#[derive(Clone, Default, PartialEq)]
-enum SttState {
-    /// Not recording.
-    #[default]
-    Idle,
-    /// Capturing the microphone.
-    Recording,
-    /// Post-capture work in progress; the string is a user-facing label
-    /// ("Downloading model…" / "Transcribing…").
-    Busy(String),
-    /// The last dictation failed (message shown briefly in the pill). `mic` marks
-    /// the failures the OS microphone settings could fix — the pill offers a
-    /// shortcut there, which would be nonsense for e.g. a failed model download.
-    Error { message: String, mic: bool },
-}
-
-impl SttState {
-    /// An `Error` from a dictation failure, offering the mic-settings shortcut
-    /// only where the OS permission screen is the actual remedy.
-    fn error(e: &anyhow::Error) -> Self {
-        Self::Error {
-            message: format!("{e:#}"),
-            mic: crate::stt::mic_settings_would_help(e),
-        }
-    }
-}
-
-/// Where a pane's read-aloud stands, for its controls.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReadState {
-    /// No reading: its speaker reads the agent's last reply.
-    Idle,
-    /// The voice is on this pane (or gathering its reply to start).
-    Playing,
-    /// A reading stopped part-way, waiting to resume where it left off.
-    Paused,
-}
-
-/// One pane's reading: its reply as the pieces it is spoken in
-/// (`readaloud::chunks`), and the piece to speak next — where a pause left off.
-struct PaneReading {
-    pieces: Vec<String>,
-    next: usize,
-}
-
-/// What a reading will say, once its reply has been gathered.
-enum Utterance {
-    /// A pane's reply: its pieces and the one to start at. Kept as the pane's
-    /// reading, so it can be paused, resumed and started over.
-    Reading(Vec<String>, usize),
-    /// A word about read-aloud itself ("nothing to read"), said once, not kept.
-    Notice(String),
-}
-
-/// Read-aloud's bookkeeping: every pane's reading, which one the voice is on, and
-/// the auto-reads waiting their turn. The voice itself (`tts::Speech`) is held by
-/// the app beside it.
-///
-/// One voice at a time: starting or resuming a pane pauses whichever is speaking,
-/// and that pane keeps its place — so each pane can be paused, resumed and started
-/// over on its own.
-#[derive(Default)]
-struct Readings {
-    panes: HashMap<Uuid, PaneReading>,
-    /// What the voice is on — a pane, or `None` for a notice — and that reading's
-    /// generation, from the moment its reply starts being gathered.
-    current: Option<(Option<Uuid>, u64)>,
-    generation: u64,
-    /// Panes whose new replies auto-read reads next, oldest first.
-    queue: std::collections::VecDeque<Uuid>,
-}
-
-impl Readings {
-    fn state(&self, iid: Uuid) -> ReadState {
-        if self.current.is_some_and(|(pane, _)| pane == Some(iid)) {
-            ReadState::Playing
-        } else if self.panes.contains_key(&iid) {
-            ReadState::Paused
-        } else {
-            ReadState::Idle
-        }
-    }
-
-    /// The pane the voice is on, if it is on one.
-    fn speaking_pane(&self) -> Option<Uuid> {
-        self.current.and_then(|(pane, _)| pane)
-    }
-
-    /// The voice stops where it is — `at`, the piece it was on, if it had started —
-    /// and the pane it was reading keeps that place.
-    fn hush(&mut self, at: Option<usize>) {
-        if let Some((Some(iid), _)) = self.current.take()
-            && let Some(at) = at
-            && let Some(reading) = self.panes.get_mut(&iid)
-        {
-            reading.next = at;
-            if at >= reading.pieces.len() {
-                self.panes.remove(&iid);
-            }
-        }
-    }
-
-    /// Start a reading of `pane` (or a notice), once the previous one is hushed.
-    /// Returns its generation.
-    fn begin(&mut self, pane: Option<Uuid>) -> u64 {
-        self.generation += 1;
-        self.current = Some((pane, self.generation));
-        self.generation
-    }
-
-    /// The reading's reply is gathered: keep `reading` (pieces, first piece) as the
-    /// pane's. `None` — nothing to read, a notice says so — leaves the pane idle.
-    /// `false` if the reading was stopped or replaced while it was gathered.
-    fn loaded(&mut self, generation: u64, reading: Option<(Vec<String>, usize)>) -> bool {
-        let Some((pane, at)) = self.current else {
-            return false;
-        };
-        if at != generation {
-            return false;
-        }
-        match (pane, reading) {
-            (Some(iid), Some((pieces, next))) => {
-                self.panes.insert(iid, PaneReading { pieces, next });
-            }
-            (Some(_), None) => self.current = Some((None, generation)),
-            (None, _) => {}
-        }
-        true
-    }
-
-    /// The voice reached the end of a reading on its own: the reading is done.
-    /// `false` if it had already been stopped or replaced.
-    fn finished(&mut self, generation: u64) -> bool {
-        if self.current.is_none_or(|(_, at)| at != generation) {
-            return false;
-        }
-        if let Some((Some(iid), _)) = self.current.take() {
-            self.panes.remove(&iid);
-        }
-        true
-    }
-
-    /// `iid`'s reading as it stands: its pieces, and where it resumes.
-    fn resume_point(&self, iid: Uuid) -> Option<(Vec<String>, usize)> {
-        self.panes.get(&iid).map(|r| (r.pieces.clone(), r.next))
-    }
-
-    /// Wind `iid`'s reading back to its first piece. `false` if it has none.
-    fn rewind(&mut self, iid: Uuid) -> bool {
-        self.panes.get_mut(&iid).map(|r| r.next = 0).is_some()
-    }
-
-    /// Forget `iid`'s reading. `true` if the voice was on it — the caller silences
-    /// it, and the queued auto-reads go too: stopping means quiet.
-    fn stop(&mut self, iid: Uuid) -> bool {
-        self.panes.remove(&iid);
-        if self.speaking_pane() == Some(iid) {
-            self.current = None;
-            self.queue.clear();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Auto-read `iid`'s new reply: `true` to read it now (the voice is free), or
-    /// it waits its turn behind what is being read.
-    fn enqueue(&mut self, iid: Uuid) -> bool {
-        if self.current.is_none() {
-            return true;
-        }
-        if !self.queue.contains(&iid) {
-            self.queue.push_back(iid);
-        }
-        false
-    }
-
-    /// Drop what belongs to panes that are gone.
-    fn retain(&mut self, live: &HashSet<Uuid>) {
-        self.panes.retain(|iid, _| live.contains(iid));
-        self.queue.retain(|iid| live.contains(iid));
-    }
-}
-
-/// How many lines of a pane's buffer read-aloud searches for the last reply.
-const READ_ALOUD_LINES: usize = 2000;
-/// How much of a Claude transcript's tail read-aloud parses — plenty for any one
-/// turn, without reading a session's whole history to find its last reply.
-const READ_ALOUD_TRANSCRIPT_BYTES: u64 = 4 << 20;
-
-/// Everything needed to find a pane's last reply, gathered on the UI thread so
-/// the slow part — reading a transcript, asking tmux for its scrollback — runs
-/// off it.
-struct ReplySource {
-    /// The pane's buffer as muxel's own terminal holds it.
-    screen: String,
-    /// The local tmux session behind the pane, which holds the real scrollback.
-    tmux_session: Option<String>,
-    /// Claude's transcript for the pane's session, when it is on this machine.
-    transcript: Option<PathBuf>,
-    /// Said before the reply when announcing is on ("Claude says:").
-    announce: Option<String>,
-}
-
-impl ReplySource {
-    /// The words to say for the pane's last reply, or `None` if it has none that
-    /// aren't code. Blocking — call it off the UI thread.
-    fn utterance(
-        self,
-        scope: muxel_core::ReadAloudScope,
-        opts: &muxel_core::readaloud::SpeakOptions,
-    ) -> Option<String> {
-        use muxel_core::readaloud;
-        let screen = self
-            .tmux_session
-            .as_deref()
-            .and_then(|session| integrations::tmux_capture(session, READ_ALOUD_LINES))
-            .unwrap_or(self.screen);
-        // The transcript is exact — the model's own markdown, with every tool call
-        // a separate entry — but only while it is the conversation on screen: a
-        // stale session binding must never read out some other conversation.
-        let reply = self
-            .transcript
-            .as_deref()
-            .and_then(|path| read_file_tail(path, READ_ALOUD_TRANSCRIPT_BYTES))
-            .and_then(|jsonl| readaloud::reply_from_claude_transcript(&jsonl, scope))
-            .filter(|reply| readaloud::reply_on_screen(reply, &screen))
-            .or_else(|| readaloud::reply_from_screen(&screen, scope))?;
-        let spoken = readaloud::speakable(&reply, opts);
-        if spoken.is_empty() {
-            return None;
-        }
-        Some(match self.announce {
-            // Pane names carry agents' title glyphs (`✳ Fix the pager`); clean
-            // them like the reply, so the voice doesn't read a spinner's name.
-            Some(intro) => format!("{}\n{spoken}", readaloud::speakable(&intro, opts)),
-            None => spoken,
-        })
-    }
-}
-
-/// The last `max` bytes of a file, lossily decoded (a torn first line is the
-/// caller's to skip).
-fn read_file_tail(path: &std::path::Path, max: u64) -> Option<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    file.seek(SeekFrom::Start(len.saturating_sub(max))).ok()?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf).ok()?;
-    Some(String::from_utf8_lossy(&buf).into_owned())
-}
-
 /// The small label shown under the cursor while dragging a project row.
 struct DragGhost {
     label: SharedString,
@@ -2370,24 +2044,6 @@ impl Render for DragGhost {
                     .child(self.label.clone()),
             )
     }
-}
-
-/// Current unix time in seconds (0 if the clock is somehow before the epoch).
-fn now_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// State of the remote-project wizard's "Scan for projects" action: scanning a
-/// host for `.muxel/workspace.json` markers, then the found roots (or an error).
-#[derive(Clone)]
-enum RemoteScanState {
-    Idle,
-    Scanning,
-    Found(Vec<String>),
-    Failed(String),
 }
 
 struct TerminalSpawnMeta {
@@ -2435,8 +2091,6 @@ pub struct MuxelApp {
     /// Whether `tmux` is installed on a unix host (gates the local-tmux default;
     /// refreshed each tick). Always false on Windows — muxel's tmux path is unix.
     tmux_available: bool,
-    /// Tick counter throttling remote branch-label polling (every 5th tick).
-    remote_poll_count: u32,
     /// A background Grok PID→session-id refresh is already in flight.
     #[cfg(windows)]
     grok_session_syncing: bool,
@@ -2481,10 +2135,6 @@ pub struct MuxelApp {
     /// Cached branch names for the active project (the "Merge into…" picker),
     /// refreshed off the UI thread so the menu doesn't run `git branch` per frame.
     git_diff_branches: Vec<String>,
-    /// Remote projects whose last connect attempt failed (pid → error). Drives
-    /// the pane-area "Reconnect / Scan for projects" state; cleared on retry
-    /// and on a successful connect.
-    remote_connect_failed: HashMap<Uuid, String>,
     /// Guards against overlapping git-status refreshes for the panel.
     git_diff_loading: bool,
     /// The git-diff panel's commit-message input.
@@ -2575,34 +2225,6 @@ pub struct MuxelApp {
     split_resize_notify_task: Option<Task<()>>,
     /// Projects whose `.muxel/MEMORY.md` we've ensured this session (once each).
     memory_ensured: HashSet<Uuid>,
-    /// Remote projects whose layout we've reconciled with the host this session
-    /// (the connect-time pull/push decision runs once each, like `memory_ensured`).
-    remote_synced: HashSet<Uuid>,
-    /// Remote projects with a connect in flight. `remote_synced` can't serve here:
-    /// it isn't set until the ssh check *returns*, so two connects could otherwise
-    /// overlap — each carrying the layout it fetched before the other landed.
-    remote_connecting: HashSet<Uuid>,
-    /// One connect per remote host at a time, and one "Connected" per host.
-    host_connects: HostConnects,
-    /// Last-seen layout `content_key` per remote project, to detect real changes
-    /// (vs. timestamp-only churn) for the debounced push.
-    layout_keys: HashMap<Uuid, String>,
-    /// Last-seen layout `edit_key` per project, telling a real edit (which gets a new
-    /// revision) from session bookkeeping this machine filled in by itself (which
-    /// keeps the one it had — see `RemoteLayout::edit_key`).
-    layout_edit_keys: HashMap<Uuid, String>,
-    /// Pending debounced layout pushes: project id → earliest time to push.
-    remote_push_due: HashMap<Uuid, Instant>,
-    /// Content key of each synced project's `.muxel/workspace.json` as this machine
-    /// last wrote or adopted it. A live poll that reads any other key is looking at
-    /// a peer's write (see `muxel_core::peer_layout_action`).
-    layout_synced_keys: HashMap<Uuid, String>,
-    /// Projects with a layout push in flight — one at a time each, so a slow host
-    /// never has two pushes racing over the same file.
-    remote_push_inflight: HashSet<Uuid>,
-    /// Projects whose last layout push failed. Reported once per failing streak,
-    /// not on every retry; cleared by the next successful push.
-    layout_push_failing: HashSet<Uuid>,
     /// Per-project generation for deferred pane fleets. Starting a newer restore
     /// cancels the older task before it can launch or focus another pane.
     deferred_activation_generation: HashMap<Uuid, u64>,
@@ -2665,10 +2287,6 @@ pub struct MuxelApp {
     settings_resize: Option<(Point<Pixels>, gpui::Size<Pixels>)>,
     /// Active settings-move drag: (start cursor pos, base offset).
     settings_move: Option<(Point<Pixels>, Point<Pixels>)>,
-    /// Update modal card size (resizable via the bottom-right corner).
-    update_modal_size: gpui::Size<Pixels>,
-    /// Active update-modal-resize drag: (start cursor pos, base size).
-    update_resize: Option<(Point<Pixels>, gpui::Size<Pixels>)>,
     /// A terminal shown maximized over the pane area (transient; not persisted).
     maximized: Option<Uuid>,
     /// Panes detached into their own OS windows, keyed by instance id.
@@ -2692,8 +2310,6 @@ pub struct MuxelApp {
     /// Quit dialog: also kill muxel's LOCAL tmux sessions (off by default;
     /// reset each time the dialog opens).
     quit_kill_tmux_local: bool,
-    /// Quit dialog: also kill muxel's REMOTE (SSH) tmux sessions.
-    quit_kill_tmux_remote: bool,
     /// Whether the keyboard-shortcut cheat-sheet overlay is shown.
     show_keys: bool,
     /// Active terminal scrollback search (None = not searching).
@@ -2704,20 +2320,6 @@ pub struct MuxelApp {
     broadcasting: bool,
     /// Reused input for the broadcast bar.
     broadcast_input: Entity<InputState>,
-    /// Speech-to-text dictation state (idle / recording / transcribing / error).
-    stt_state: SttState,
-    /// The in-flight microphone capture, held while `stt_state == Recording`.
-    stt_recording: Option<crate::stt::Recording>,
-    /// True while a push-to-hold dictation is active (started on the hold chord's
-    /// key-down, stopped on the next key-up).
-    stt_hold: bool,
-    /// Every pane's read-aloud, and which one the voice is on.
-    readings: Readings,
-    /// The voice for `readings`' current reading, once it has started speaking.
-    read_aloud_speech: Option<crate::tts::Speech>,
-    /// True while the wake command's sweep is walking the workspace — the guard
-    /// against a second sweep stacking on top of the running one.
-    waking: bool,
     /// Set once the user confirms quitting, so the close hook stops vetoing.
     confirm_quit: bool,
     /// When set, the agent picker is shown: (target, placement, anchor point).
@@ -2737,15 +2339,6 @@ pub struct MuxelApp {
     /// Project git modal (commit / new branch) + its reused input.
     git_modal: Option<GitModal>,
     git_action_input: Entity<InputState>,
-    /// New-remote-project wizard: visible flag, chosen host, and its inputs.
-    show_new_remote: bool,
-    nr_host: Option<Uuid>,
-    nr_dir: Entity<InputState>,
-    nr_name: Entity<InputState>,
-    /// Inline result of the wizard's "Verify" (shown above the buttons).
-    nr_verify: RemoteTestState,
-    /// Inline result of the wizard's "Scan for projects" (found remote roots).
-    nr_scan: RemoteScanState,
     /// Reusable task launchers.
     runners: Vec<Runner>,
     /// Reusable text snippets typed into an existing pane on demand.
@@ -2754,17 +2347,6 @@ pub struct MuxelApp {
     loops: Vec<Loop>,
     /// Live loop runs: spawned instance id → run state (for post-run handling).
     running_loops: HashMap<Uuid, LoopRun>,
-    /// Saved SSH remote hosts (the host library; edited in settings).
-    remotes: Vec<RemoteHost>,
-    /// Reusable SSH login identities hosts can reference (shared credentials).
-    identities: Vec<Identity>,
-    /// In-memory SSH passwords entered this session (host id → password), for
-    /// hosts using password auth without a keychain-saved password. Never
-    /// persisted; cleared on exit.
-    session_passwords: HashMap<Uuid, String>,
-    /// Active password prompt (host without a saved password), + its input.
-    password_prompt: Option<PasswordPrompt>,
-    password_prompt_input: Entity<InputState>,
     /// Anchor point for the toolbar "Run task" runner popup, when open.
     runners_menu: Option<Point<Pixels>>,
     /// Anchor point for the toolbar "Loops" popup, when open.
@@ -2779,14 +2361,6 @@ pub struct MuxelApp {
     runner_input: Entity<InputState>,
     /// Whether the first-run Terms acceptance screen is shown.
     show_terms: bool,
-    /// How muxel was installed (decides whether updates self-apply).
-    install_kind: crate::update::InstallKind,
-    /// In-app updater state (title-bar button + update modal).
-    update_state: UpdateState,
-    /// Whether the update modal is shown.
-    show_update_modal: bool,
-    /// Background task: checks for updates on launch, then daily.
-    _update_timer: Task<()>,
     /// Ctrl+P search palette (open files / jump to named instances).
     show_search_palette: bool,
     search_input: Entity<InputState>,
@@ -2804,15 +2378,6 @@ pub struct MuxelApp {
     /// Active project's file contents, read once when the panel opens, so typing
     /// re-searches in memory without re-reading from disk.
     find_contents: Vec<(PathBuf, String)>,
-    /// The `muxel ctl` server, while outside control is on (see `control_api`).
-    control: Option<crate::control::Server>,
-    /// Answers the control server's requests on the UI thread.
-    control_task: Option<Task<()>>,
-    /// The control server couldn't start; not retried each tick until the
-    /// setting is toggled again.
-    control_failed: bool,
-    /// Prompts typed through `muxel ctl`, per pane, for `show` and `wait`.
-    control_turns: HashMap<Uuid, control_api::ControlTurn>,
 }
 
 /// One content-search match (file + 0-based line + the matched line text).
@@ -2858,9 +2423,6 @@ enum PaletteCommand {
     ToggleDashboard,
     OpenSettings,
     OpenMemory,
-    ReadAloud,
-    ReadAloudRestart,
-    ReadAloudStop,
     RunRunner(usize),
     SendSnippet(usize),
 }
@@ -3251,8 +2813,6 @@ enum ConfirmAction {
     DeleteRunner(usize),
     DeleteSnippet(usize),
     DeleteLoop(usize),
-    DeleteRemote(usize),
-    DeleteIdentity(usize),
     CloseInstance(Uuid),
     /// Close every other tab in the pane holding this instance (keeps it).
     CloseOtherTabs(Uuid),
@@ -3283,17 +2843,6 @@ enum ConfirmAction {
     DiscardWorktreeChanges(Uuid),
     /// Remove a worktree entirely (close its panes, delete worktree + branch).
     DiscardWorktree(Uuid),
-    /// Remove a stale known_hosts entry (`ssh-keygen -R`) and retry the
-    /// operation that hit the changed host key.
-    TrustHostKey {
-        /// The known_hosts token exactly as ssh reported it (host, `[host]:port`,
-        /// or a config alias).
-        entry: String,
-        /// The known_hosts file holding the stale entry (from ssh's "Offending
-        /// key" line); None = ssh-keygen's default.
-        file: Option<String>,
-        retry: SshRetry,
-    },
 }
 
 impl ConfirmAction {
@@ -3319,96 +2868,6 @@ impl ConfirmAction {
 /// that already exists). So one project per host leads the connect and the rest
 /// wait, then connect over the shared master. The host is announced once, too:
 /// "Connected to …" for every project on it was the same news said N times.
-#[derive(Default)]
-struct HostConnects {
-    /// Hosts a project is connecting to right now → the projects waiting on that
-    /// connect, each with its `defer_spawns`.
-    opening: HashMap<Uuid, Vec<(Uuid, bool)>>,
-    /// When each host last connected. Its master outlives that by at least
-    /// `ControlPersist`, so for a while a connect can simply ride it.
-    warm: HashMap<Uuid, Instant>,
-    /// Hosts already announced as connected. A failed connect forgets its host, so
-    /// the host coming back is announced again.
-    announced: HashSet<Uuid>,
-}
-
-/// How one project's connect proceeds (see [`HostConnects::begin`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HostTurn {
-    /// Open the host's connection; the host's other projects wait on this one.
-    Lead,
-    /// The host just connected: go straight over its still-warm master.
-    Ride,
-    /// Another project is opening the connection; connect once it is up.
-    Wait,
-}
-
-impl HostConnects {
-    /// How long after a connect its host counts as warm — well inside ssh's
-    /// `ControlPersist=60`, which keeps the master that long past its last client.
-    const WARM: Duration = Duration::from_secs(30);
-
-    /// Begin `pid`'s connect to `host`. A waiting project is queued (once).
-    fn begin(&mut self, host: Uuid, pid: Uuid, defer_spawns: bool, now: Instant) -> HostTurn {
-        if let Some(waiting) = self.opening.get_mut(&host) {
-            if !waiting.iter().any(|(p, _)| *p == pid) {
-                waiting.push((pid, defer_spawns));
-            }
-            return HostTurn::Wait;
-        }
-        if self
-            .warm
-            .get(&host)
-            .is_some_and(|at| now.saturating_duration_since(*at) < Self::WARM)
-        {
-            return HostTurn::Ride;
-        }
-        self.opening.insert(host, Vec::new());
-        HostTurn::Lead
-    }
-
-    /// A connect to `host` finished (`ok` or not). A leading one hands back the
-    /// projects that were waiting on it. A failure cools the host and forgets its
-    /// announcement, so the next connect leads again and its success is news.
-    fn finish(&mut self, host: Uuid, turn: HostTurn, ok: bool, now: Instant) -> Vec<(Uuid, bool)> {
-        if ok {
-            self.warm.insert(host, now);
-        } else {
-            self.warm.remove(&host);
-            self.announced.remove(&host);
-        }
-        if turn == HostTurn::Lead {
-            self.opening.remove(&host).unwrap_or_default()
-        } else {
-            Vec::new()
-        }
-    }
-
-    /// Whether to say "Connected to …" for `host` now: the first time it
-    /// connects, and again after a connect to it has failed.
-    fn announce(&mut self, host: Uuid) -> bool {
-        self.announced.insert(host)
-    }
-}
-
-#[derive(Clone)]
-enum SshRetry {
-    /// Nothing automatic — the success toast says to retry the operation.
-    None,
-    /// Re-run the project connect pre-flight (spawns its panes on success).
-    ConnectProject(Uuid),
-    /// Re-run the settings "Test connection" for host `idx` (the one-shot verify
-    /// password rides along in memory, same trust level as `session_passwords`).
-    VerifyHost {
-        idx: usize,
-        password: Option<String>,
-    },
-    /// Re-run the remote-project wizard's directory verify.
-    VerifyRemoteDir,
-    /// Re-run the remote-project wizard's host scan.
-    ScanRemoteDirs,
-}
-
 /// State for the confirmation modal (title/message + the pending action).
 struct PendingConfirm {
     title: SharedString,
@@ -3434,26 +2893,6 @@ struct GitModal {
     /// the commit (parallel to `files`). Empty for `NewBranch`.
     files: Vec<integrations::GitChange>,
     selected: Vec<bool>,
-}
-
-/// A prompt for an SSH password not saved in the keychain. `Connect` stores the
-/// entered password in memory for the session and (re)spawns the project's panes;
-/// `Verify` tests once with the password and forgets it.
-struct PasswordPrompt {
-    /// The host being connected/verified (drives the displayed host name).
-    host_id: Uuid,
-    /// Who owns the entered secret — the host's referenced identity, else the host.
-    /// The entered password is cached/reused under this id (shared across hosts on
-    /// the same identity).
-    owner_id: Uuid,
-    action: PasswordAction,
-}
-
-enum PasswordAction {
-    /// Store the password for the session, then spawn this project's terminals.
-    Connect(Uuid),
-    /// Test the host at this index once, without storing the password.
-    Verify(usize),
 }
 
 /// A worktree whose last instance just closed with work that isn't fully landed
@@ -3493,7 +2932,6 @@ enum SaveTarget {
     Settings,
     WorkspaceIndex,
     Memory,
-    LayoutBackup,
 }
 
 impl SaveTarget {
@@ -3503,7 +2941,6 @@ impl SaveTarget {
             Self::Settings => t("Couldn't save settings"),
             Self::WorkspaceIndex => t("Couldn't save workspace list"),
             Self::Memory => t("Couldn't save project memory"),
-            Self::LayoutBackup => t("Layout backup failed"),
         }
     }
 }
@@ -4243,7 +3680,6 @@ impl MuxelApp {
                         this.tick(window, cx);
                         this.handle_notification_click(window, cx);
                         this.pump_tray(window, cx);
-                        this.sync_control(cx);
                     })
                     .is_err()
                 {
@@ -4340,21 +3776,6 @@ impl MuxelApp {
         });
 
         // Check GitHub for a newer release shortly after launch, then once a day.
-        let update_timer = cx.spawn(async move |view: WeakEntity<Self>, cx| {
-            cx.background_executor().timer(Duration::from_secs(2)).await;
-            loop {
-                if view
-                    .update(cx, |this, cx| this.check_for_updates(cx))
-                    .is_err()
-                {
-                    break;
-                }
-                cx.background_executor()
-                    .timer(Duration::from_secs(24 * 60 * 60))
-                    .await;
-            }
-        });
-
         // Re-skin terminals whenever the active theme changes. NOTE: this must
         // NOT write `self.theme` or persist — the Theme global is also mutated by
         // zoom (set_ui_scale) and OS dark/light switches (which re-apply a default
@@ -4564,27 +3985,6 @@ impl MuxelApp {
         )
         .detach();
 
-        let nr_dir = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(t("/path/to/project on the remote host"))
-        });
-        let nr_name = cx.new(|cx| InputState::new(window, cx).placeholder(t("Project name")));
-
-        let password_prompt_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .masked(true)
-                .placeholder(t("SSH password"))
-        });
-        cx.subscribe_in(
-            &password_prompt_input,
-            window,
-            |this, _input, ev: &InputEvent, window, cx| {
-                if let InputEvent::PressEnter { .. } = ev {
-                    this.confirm_password_prompt(window, cx);
-                }
-            },
-        )
-        .detach();
-
         let file_browser_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(t("Search files…")));
         cx.subscribe_in(
@@ -4629,15 +4029,7 @@ impl MuxelApp {
                 lp.last_run = Some(now_arm);
             }
         }
-        let remotes = settings.remotes.clone();
-        let identities = settings.identities.clone();
-        // Dir for per-host SSH ControlMaster sockets (created once; the path is
-        // computed purely thereafter by `control_path_for`).
-        if let Some(d) = muxel_store::data_dir() {
-            let _ = std::fs::create_dir_all(d.join("ssh"));
-        }
         let show_terms = settings.accepted_terms_version < muxel_core::CURRENT_TERMS_VERSION;
-        let install_kind = crate::update::InstallKind::detect();
 
         // Ensure a workspaces index exists (migrating a legacy workspace once).
         let workspaces = muxel_store::migrate_to_workspaces();
@@ -4659,8 +4051,6 @@ impl MuxelApp {
             gh_available: program_on_path("gh"),
             sshpass_available: program_on_path("sshpass"),
             tmux_available: cfg!(unix) && program_on_path("tmux"),
-            remote_connect_failed: HashMap::new(),
-            remote_poll_count: 0,
             #[cfg(windows)]
             grok_session_syncing: false,
             theme: settings.theme.clone(),
@@ -4708,8 +4098,6 @@ impl MuxelApp {
             settings_offset: point(px(0.0), px(0.0)),
             settings_resize: None,
             settings_move: None,
-            update_modal_size: size(px(560.0), px(520.0)),
-            update_resize: None,
             maximized: None,
             popouts: HashMap::new(),
             secondary_windows: Vec::new(),
@@ -4719,18 +4107,11 @@ impl MuxelApp {
             pending_browser_redock: Vec::new(),
             show_quit_confirm: false,
             quit_kill_tmux_local: false,
-            quit_kill_tmux_remote: false,
             show_keys: false,
             term_search: None,
             term_search_input,
             broadcasting: false,
             broadcast_input,
-            stt_state: SttState::Idle,
-            stt_recording: None,
-            stt_hold: false,
-            readings: Readings::default(),
-            read_aloud_speech: None,
-            waking: false,
             confirm_quit: false,
             place_menu: None,
             tab_drop: None,
@@ -4749,21 +4130,10 @@ impl MuxelApp {
             git_diff_loading: false,
             git_diff_commit_input,
             diff_file_windows: HashMap::new(),
-            show_new_remote: false,
-            nr_host: None,
-            nr_dir,
-            nr_name,
-            nr_verify: RemoteTestState::Idle,
-            nr_scan: RemoteScanState::Idle,
             runners,
             snippets,
             loops,
             running_loops: HashMap::new(),
-            remotes,
-            identities,
-            session_passwords: HashMap::new(),
-            password_prompt: None,
-            password_prompt_input,
             runners_menu: None,
             loops_menu: None,
             snippets_menu: None,
@@ -4789,15 +4159,6 @@ impl MuxelApp {
             save_errors: HashMap::new(),
             split_resize_notify_task: None,
             memory_ensured: HashSet::new(),
-            remote_synced: HashSet::new(),
-            remote_connecting: HashSet::new(),
-            host_connects: HostConnects::default(),
-            layout_keys: HashMap::new(),
-            layout_edit_keys: HashMap::new(),
-            remote_push_due: HashMap::new(),
-            layout_synced_keys: HashMap::new(),
-            remote_push_inflight: HashSet::new(),
-            layout_push_failing: HashSet::new(),
             deferred_activation_generation: HashMap::new(),
             focus_handle: cx.focus_handle(),
             settings,
@@ -4807,10 +4168,6 @@ impl MuxelApp {
             _resource_timer: resource_timer,
             bounds_save_task: None,
             show_terms,
-            install_kind,
-            update_state: UpdateState::Idle,
-            show_update_modal: false,
-            _update_timer: update_timer,
             show_search_palette: false,
             search_input,
             search_query: String::new(),
@@ -4822,18 +4179,12 @@ impl MuxelApp {
             find_selected: 0,
             find_results: Vec::new(),
             find_contents: Vec::new(),
-            control: None,
-            control_task: None,
-            control_failed: false,
-            control_turns: HashMap::new(),
         };
 
         // Flush any coalesced auto-title before shutdown. On Unix, muxel also
         // hands tmux's exit policy back so it exits with its last session.
         cx.on_app_quit(|this, _cx| {
             this.persist();
-            // Stop serving `muxel ctl` and withdraw its endpoint file.
-            this.control = None;
             if cfg!(unix) {
                 integrations::restore_tmux_exit_empty();
             }
@@ -4877,7 +4228,6 @@ impl MuxelApp {
                             return false;
                         }
                         this.quit_kill_tmux_local = false;
-                        this.quit_kill_tmux_remote = false;
                         this.show_quit_confirm = true;
                         cx.notify();
                         false
@@ -4930,185 +4280,6 @@ impl MuxelApp {
             }
             self.ensure_project_terminals_deferred(pid, window, cx);
         }
-        // Bring every OTHER remote project's tmux panes back in the background, so an
-        // agent left running on a host reconnects on launch instead of waiting to be
-        // clicked into. Skip any host that would pop a password prompt — a startup
-        // password storm across several hosts is worse than reconnecting them lazily.
-        // The connect callback only focuses the active project, so these don't steal
-        // focus, and `remote_connecting` dedupes against the active connect above.
-        let reattach: Vec<Uuid> = self
-            .workspace
-            .projects
-            .iter()
-            .map(|p| p.id)
-            .filter(|&pid| Some(pid) != active)
-            .filter(|&pid| self.remote_can_connect_unattended(pid))
-            .collect();
-        for pid in reattach {
-            self.ensure_project_terminals(pid, window, cx);
-        }
-    }
-
-    /// Whether a remote project can connect with no user interaction — key auth, or
-    /// password auth whose password is already in memory or the keychain. Gates the
-    /// startup auto-reattach so it never triggers a password prompt.
-    fn remote_can_connect_unattended(&self, pid: Uuid) -> bool {
-        match self.remote_host_for_project(pid) {
-            Some(host) => host.auth != SshAuth::Password || self.remote_password(&host).is_some(),
-            None => false, // not a remote project (or host gone) → nothing to reattach
-        }
-    }
-
-    /// Per-host ControlMaster socket path (its directory is created). Shared by
-    /// the host's panes and its git calls so they reuse one authenticated
-    /// connection — making repeated git invocations cheap and one dropped
-    /// connection recoverable.
-    fn control_path_for(host_id: Uuid) -> String {
-        // Pure (safe to call during render). The `ssh/` dir is created once at
-        // startup (see the constructor).
-        muxel_store::data_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("ssh")
-            .join(format!("{}.sock", &host_id.simple().to_string()[..8]))
-            .display()
-            .to_string()
-    }
-
-    /// An SSH password for a host: the in-memory session password first, else the
-    /// one saved in the OS keychain. `None` if neither is set.
-    /// The effective SSH password for a (already resolved) host: whoever owns its
-    /// secret — the referenced login identity, else the host itself — resolved first
-    /// from this session's in-memory cache, then the keychain (identity vs host
-    /// namespace). Lets several hosts share one stored password via an identity.
-    fn remote_password(&self, host: &RemoteHost) -> Option<String> {
-        let owner = host.secret_owner(&self.identities);
-        if let Some(password) = self.session_passwords.get(&owner) {
-            return Some(password.clone());
-        }
-        let _phase = ui_profile::phase("secrets", "keychain-password", None);
-        if owner == host.id {
-            crate::secrets::get_remote_password(owner)
-        } else {
-            crate::secrets::get_identity_password(owner)
-        }
-    }
-
-    /// The configured remote host for an instance's project, if any — with any
-    /// referenced login identity's credentials already overlaid ([`RemoteHost::effective`]).
-    fn remote_host_for_instance(&self, iid: Uuid) -> Option<RemoteHost> {
-        let inst = self.workspace.instance(iid)?;
-        let r = self.workspace.project(inst.project_id)?.remote.as_ref()?;
-        self.remotes
-            .iter()
-            .find(|h| h.id == r.host_id)
-            .map(|h| h.effective(&self.identities))
-    }
-
-    /// Program/args (+ extra env) to run an instance's command on a remote host
-    /// over SSH: `ssh [opts] host -- '…'`, or `sshpass -e ssh …` for password
-    /// auth (the password — keychain or this session — is passed via `$SSHPASS`).
-    /// With password auth but no password available, falls back to plain `ssh`
-    /// (it can prompt in the pane). Remote panes default to a persistent tmux
-    /// session for reconnect resilience.
-    fn remote_program_args(
-        &self,
-        inst: Option<&Instance>,
-        host: &RemoteHost,
-        remote_cwd: &str,
-        resolved: &ResolvedLaunch,
-    ) -> (String, Vec<String>, Vec<(String, String)>) {
-        let control_path = Self::control_path_for(host.id);
-        // `RemoteHost::use_tmux` is the single gate: it also answers "never" for a
-        // Windows host, which has no tmux to attach to.
-        let use_tmux = host.use_tmux(inst.is_some_and(|i| i.use_tmux));
-        // The session recorded on the instance wins — it is what the iOS app
-        // launches from, and what a previous run left running on the host. See
-        // `tmux::session_for`.
-        let session = inst
-            .map(|i| muxel_core::tmux::session_for(i.tmux_session.as_deref(), &host.name, i.id));
-        let ssh_argv = muxel_core::ssh::ssh_args(&muxel_core::ssh::SshSpec {
-            host,
-            control_path: &control_path,
-            remote_cwd: Some(remote_cwd),
-            program: resolved.program.as_deref(),
-            args: &resolved.args,
-            use_tmux,
-            tmux_session: session.as_deref(),
-        });
-        // sshpass -e reads the password from $SSHPASS (kept off the command line /
-        // process list). Without a password, never use `sshpass -e` (it would
-        // error); plain ssh can prompt interactively in the pane instead.
-        if host.auth == SshAuth::Password
-            && let Some(pw) = self.remote_password(host)
-        {
-            let env = vec![("SSHPASS".to_string(), pw)];
-            let mut args = vec!["-e".to_string(), "ssh".to_string()];
-            args.extend(ssh_argv);
-            ("sshpass".to_string(), args, env)
-        } else {
-            ("ssh".to_string(), ssh_argv, Vec::new())
-        }
-    }
-
-    /// Open the password prompt for a host without a saved password.
-    fn prompt_password(
-        &mut self,
-        host_id: Uuid,
-        action: PasswordAction,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let owner_id = self
-            .remotes
-            .iter()
-            .find(|h| h.id == host_id)
-            .map(|h| h.secret_owner(&self.identities))
-            .unwrap_or(host_id);
-        self.password_prompt = Some(PasswordPrompt {
-            host_id,
-            owner_id,
-            action,
-        });
-        self.password_prompt_input
-            .update(cx, |s, cx| s.set_value("", window, cx));
-        let handle = self.password_prompt_input.read(cx).focus_handle(cx);
-        window.focus(&handle, cx);
-        cx.notify();
-    }
-
-    fn close_password_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.password_prompt = None;
-        // Don't leave the typed password sitting in the input widget.
-        self.password_prompt_input
-            .update(cx, |s, cx| s.set_value("", window, cx));
-        cx.notify();
-    }
-
-    fn confirm_password_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(p) = self.password_prompt.take() else {
-            return;
-        };
-        let pw = self.password_prompt_input.read(cx).value().to_string();
-        if pw.is_empty() {
-            // Keep the prompt open until something is entered.
-            self.password_prompt = Some(p);
-            return;
-        }
-        self.password_prompt_input
-            .update(cx, |s, cx| s.set_value("", window, cx));
-        match p.action {
-            PasswordAction::Connect(pid) => {
-                // Hold the password in memory for the session (keyed by the secret
-                // owner, so every host on this identity reuses it) and spawn the panes.
-                self.session_passwords.insert(p.owner_id, pw);
-                self.ensure_project_terminals_deferred(pid, window, cx);
-            }
-            PasswordAction::Verify(idx) => {
-                // Test once with the entered password; do not store it.
-                self.run_ssh_check(idx, Some(pw), window, cx);
-            }
-        }
-        cx.notify();
     }
 
     /// Build the launch command for an instance (program/args + system-prompt
@@ -5138,7 +4309,7 @@ impl MuxelApp {
                 .worktree_path
                 .clone()
                 .or_else(|| project.map(|project| project.root_path.clone()));
-            let local = project.is_some_and(|project| project.remote.is_none());
+            let local = project.is_some();
             (preset.clone(), cwd, local)
         };
         // Claude can replace its conversation inside the same PTY. A process-local
@@ -5244,20 +4415,11 @@ impl MuxelApp {
                 }
             };
             if !resuming
-                && i.injection != InjectionMode::None
-                && project.is_none_or(|project| project.remote.is_none())
-            {
-                add_automatic(file_link_instruction().to_string(), &mut i);
-            }
-            if !resuming
                 && let Some(p) = project
                 && p.memory_enabled
                 && i.injection != InjectionMode::None
             {
-                let root = match &p.remote {
-                    Some(r) => r.remote_root.clone(),
-                    None => p.root_path.display().to_string(),
-                };
+                let root = p.root_path.display().to_string();
                 // Refer to the file relatively when the agent starts at the project
                 // root: this string ends up in the agent's argv, and an absolute path
                 // there makes every pane of the project match `pkill -f <project>`.
@@ -5302,8 +4464,7 @@ impl MuxelApp {
             .args
             .iter()
             .any(|arg| arg == "--settings" || arg.starts_with("--settings="));
-        let local_claude = is_claude_program(agent_program.as_deref())
-            && project.is_some_and(|project| project.remote.is_none());
+        let local_claude = is_claude_program(agent_program.as_deref()) && project.is_some();
         if local_claude
             && !has_custom_settings
             && let Some(settings_path) = crate::session_binding::claude_hook_settings()
@@ -5319,59 +4480,35 @@ impl MuxelApp {
             ));
         }
 
-        // Remote (SSH) project? Resolve its configured host.
-        let remote = project.and_then(|p| p.remote.as_ref()).and_then(|r| {
-            let host = self
-                .remotes
-                .iter()
-                .find(|h| h.id == r.host_id)?
-                .effective(&self.identities);
-            Some((host, r))
-        });
-
-        // Build program/args (and, for local, the PTY working dir). For remote the
-        // command becomes `ssh … -- 'cd <dir> && exec <program>'`; the cwd lives
-        // inside that remote string, so there is no local PTY cwd.
-        let (mut spec, local_cwd, extra_env) = if let Some((host, rref)) = remote {
-            let remote_cwd = inst
-                .and_then(|i| i.worktree_path.as_ref())
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|| rref.remote_root.clone());
-            let (program, args, env) =
-                self.remote_program_args(inst, &host, &remote_cwd, &resolved);
-            (CommandSpec::program(program, args), None, env)
-        } else {
-            // Local: worktree path wins as the working dir; otherwise project root.
-            let cwd: Option<String> = inst
-                .and_then(|i| i.worktree_path.clone())
-                .map(|p| p.display().to_string())
-                .or_else(|| project.map(|p| p.root_path.display().to_string()));
-            // If this instance uses tmux, wrap the command in `tmux new-session -A`
-            // so it persists and re-attaches across restarts.
-            let spec = match inst.and_then(|i| i.tmux_session.clone()) {
-                Some(session) => {
-                    // Fork the tmux server off a command line that names no project
-                    // *before* this client creates its session — otherwise the shared
-                    // server inherits this argv and a stray `pkill -f <project>` kills
-                    // every agent in every session. See `ensure_tmux_server`.
-                    integrations::ensure_tmux_server();
-                    // No `-c`: the client is spawned with `cwd` already (below), which
-                    // is what tmux uses for a new session anyway. Passing it would put
-                    // the project's path in this client's argv for no gain.
-                    let args = muxel_core::tmux::launch_session_args(
-                        &session,
-                        None,
-                        resolved.program.as_deref(),
-                        &resolved.args,
-                    );
-                    CommandSpec::program("tmux", args)
-                }
-                None => match resolved.program.clone() {
-                    Some(program) => CommandSpec::program(program, resolved.args.clone()),
-                    None => CommandSpec::shell(),
-                },
-            };
-            (spec, cwd, Vec::new())
+        // Local: worktree path wins as the working dir; otherwise project root.
+        let local_cwd: Option<String> = inst
+            .and_then(|i| i.worktree_path.clone())
+            .map(|p| p.display().to_string())
+            .or_else(|| project.map(|p| p.root_path.display().to_string()));
+        // If this instance uses tmux, wrap the command in `tmux new-session -A`
+        // so it persists and re-attaches across restarts.
+        let mut spec = match inst.and_then(|i| i.tmux_session.clone()) {
+            Some(session) => {
+                // Fork the tmux server off a command line that names no project
+                // *before* this client creates its session — otherwise the shared
+                // server inherits this argv and a stray `pkill -f <project>` kills
+                // every agent in every session. See `ensure_tmux_server`.
+                integrations::ensure_tmux_server();
+                // No `-c`: the client is spawned with `cwd` already (below), which
+                // is what tmux uses for a new session anyway. Passing it would put
+                // the project's path in this client's argv for no gain.
+                let args = muxel_core::tmux::launch_session_args(
+                    &session,
+                    None,
+                    resolved.program.as_deref(),
+                    &resolved.args,
+                );
+                CommandSpec::program("tmux", args)
+            }
+            None => match resolved.program.clone() {
+                Some(program) => CommandSpec::program(program, resolved.args.clone()),
+                None => CommandSpec::shell(),
+            },
         };
         if let Some(cwd) = local_cwd {
             spec = spec.with_cwd(cwd);
@@ -5382,13 +4519,11 @@ impl MuxelApp {
         spec = spec.with_auto_mode(resolved.auto_mode_presses);
         spec = spec.with_submit(resolved.submit);
         spec.env = resolved.env.clone();
-        spec.env.extend(extra_env);
         // Point a memory-enabled *local* project's agent at its memory file so tools
         // can find it without being told the path. Remote agents get the path via the
         // system-prompt instruction instead (env vars don't cross the ssh boundary).
         if let Some(p) = project
             && p.memory_enabled
-            && p.remote.is_none()
         {
             let dir = p.root_path.join(MEMORY_DIR);
             spec.env.push((
@@ -5446,17 +4581,6 @@ impl MuxelApp {
         // its PTY. Its token will fail validation and dropping it kills the child.
         self.terminal_launching.remove(&instance_id);
         self.reset_terminal_runtime(instance_id);
-        // A remote password host with no saved/session password: prompt for it
-        // first (storing it in memory), then this spawn is retried via
-        // `ensure_project_terminals`. Avoids `sshpass -e` with an empty $SSHPASS.
-        if let Some(host) = self.remote_host_for_instance(instance_id)
-            && host.auth == SshAuth::Password
-            && self.remote_password(&host).is_none()
-            && let Some(pid) = self.workspace.instance(instance_id).map(|i| i.project_id)
-        {
-            self.prompt_password(host.id, PasswordAction::Connect(pid), window, cx);
-            return;
-        }
         // Whether this launch will `--resume` a saved session (true on every
         // launch after the first, for resume-capable agents).
         let was_resume = self
@@ -5536,8 +4660,8 @@ impl MuxelApp {
     fn reserve_terminal_spawn(
         &mut self,
         instance_id: Uuid,
-        window: &mut Window,
-        cx: &mut Context<Self>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
     ) -> Option<u64> {
         let _phase = ui_profile::phase("activation", "reserve-terminal", Some(instance_id));
         if self.terminals.contains_key(&instance_id)
@@ -5550,15 +4674,6 @@ impl MuxelApp {
         let token = self.next_terminal_launch_token;
         self.terminal_launching.insert(instance_id, token);
         self.reset_terminal_runtime(instance_id);
-        if let Some(host) = self.remote_host_for_instance(instance_id)
-            && host.auth == SshAuth::Password
-            && self.remote_password(&host).is_none()
-            && let Some(pid) = self.workspace.instance(instance_id).map(|i| i.project_id)
-        {
-            self.terminal_launching.remove(&instance_id);
-            self.prompt_password(host.id, PasswordAction::Connect(pid), window, cx);
-            return None;
-        }
         Some(token)
     }
 
@@ -5803,13 +4918,6 @@ impl MuxelApp {
     /// remote project this prompts for a password if needed, then verifies login
     /// **before** opening the panes — telling the user what went wrong on failure
     /// instead of filling each pane with an ssh error.
-    fn ensure_project_terminals(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        self.ensure_project_terminals_with(pid, false, window, cx);
-    }
-
-    /// Restore a project without holding the UI thread across its whole pane fleet.
-    /// Each missing pane starts in a separate turn, leaving paint and input between
-    /// terminal launches. Other call sites keep immediate spawning for now.
     fn ensure_project_terminals_deferred(
         &mut self,
         pid: Uuid,
@@ -5837,15 +4945,7 @@ impl MuxelApp {
         {
             self.ensure_project_memory(pid, cx);
         }
-        let is_remote = self.workspace.project(pid).is_some_and(|p| p.is_remote());
-        // The first time we reach a layout-synced project this session, reconcile its
-        // layout with the shared `.muxel/workspace.json` even if it has no local panes
-        // yet — an empty local layout is exactly when another machine's session should
-        // be pulled in. Remote projects always sync; local projects sync under tmux.
-        let first_sync = self.project_syncs_layout(pid) && !self.remote_synced.contains(&pid);
-
-        // Nothing to do if every pane already has a live view (and we've already
-        // reconciled the remote layout this session).
+        // Nothing to do if every pane already has a live view.
         let needs = self
             .workspace
             .project(pid)
@@ -5857,156 +4957,10 @@ impl MuxelApp {
                     && !self.editors.contains_key(&iid)
                     && !self.browsers.contains_key(&iid)
             });
-        if !needs && !first_sync {
+        if !needs {
             return;
         }
 
-        if is_remote && let Some(host) = self.remote_host_for_project(pid) {
-            // Need a password and don't have one → prompt; the Connect action
-            // re-enters here once it's stored.
-            if host.auth == SshAuth::Password && self.remote_password(&host).is_none() {
-                self.prompt_password(host.id, PasswordAction::Connect(pid), window, cx);
-                return;
-            }
-            // One connect in flight per project. A project is reached here from
-            // several places (open, focus, a respawn tick), and nothing is marked
-            // reconciled until the ssh check *returns* — so without this, a second
-            // call starts a second connect that is still carrying the layout it
-            // fetched before the first one landed. It would then tear the first's
-            // panes down (`pull_remote_layout` against a stale doc) and adopt the
-            // host's sessions a second time, giving every session two panes.
-            if !self.remote_connecting.insert(pid) {
-                return;
-            }
-            // A fresh attempt hides the failure state until it fails again.
-            self.remote_connect_failed.remove(&pid);
-            // Another of this host's projects is already opening its connection:
-            // wait for that, then connect over the shared master (see `HostConnects`).
-            let turn = self
-                .host_connects
-                .begin(host.id, pid, defer_spawns, Instant::now());
-            if turn == HostTurn::Wait {
-                return;
-            }
-            let host_id = host.id;
-            // Pre-flight: verify login (and warm the ControlMaster) before opening.
-            let control_path = Self::control_path_for(host.id);
-            let password = self.remote_password(&host);
-            let owner_id = host.secret_owner(&self.identities);
-            let name = host.name.clone();
-            // On the first connect, also fetch the host's saved layout so the
-            // callback can resolve newer-wins before spawning panes.
-            let loc = if first_sync { self.repo_loc(pid) } else { None };
-            let host_for_err = host.clone();
-            cx.spawn_in(window, async move |this, cx| {
-                let (res, fetched, sessions, has_memory) = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let res =
-                            integrations::ssh_check(&host, &control_path, password.as_deref());
-                        let (fetched, sessions, has_memory) = match (&res, loc) {
-                            (Ok(()), Some(loc)) => (
-                                integrations::fetch_remote_layout(&loc),
-                                // Agents left running on the host with no pane are
-                                // adopted back below.
-                                integrations::list_remote_tmux_sessions(&loc),
-                                // Evidence for the shared-memory flag when the host's
-                                // doc is too old to carry one.
-                                integrations::memory_file_exists(&loc),
-                            ),
-                            _ => (None, None, false),
-                        };
-                        (res, fetched, sessions, has_memory)
-                    })
-                    .await;
-                let _ = this.update_in(cx, |this, window, cx| match res {
-                    Ok(()) => {
-                        this.remote_connecting.remove(&pid);
-                        this.remote_connect_failed.remove(&pid);
-                        let waiting =
-                            this.host_connects
-                                .finish(host_id, turn, true, Instant::now());
-                        // Once per host, however many of its projects connect.
-                        if this.host_connects.announce(host_id) {
-                            this.add_event(
-                                NotifKind::Success,
-                                tf("Connected to “{name}”", &[("name", &name.to_string())]),
-                                String::new(),
-                            );
-                        }
-                        if first_sync {
-                            this.apply_remote_layout_sync(pid, fetched, has_memory, window, cx);
-                            // After the sync, so a session the layout accounts for is
-                            // not adopted a second time.
-                            if let Some(sessions) = sessions {
-                                // Finish any close whose kill never landed *first*,
-                                // so a session the user closed is reaped rather than
-                                // adopted back as a pane.
-                                this.reap_closed_sessions(pid, &sessions, cx);
-                                this.adopt_remote_sessions(pid, &sessions, window, cx);
-                            }
-                        }
-                        if defer_spawns {
-                            this.spawn_project_terminals_deferred(pid, window, cx);
-                        } else {
-                            this.spawn_project_terminals_now(pid, window, cx);
-                        }
-                        // A pull may have replaced the layout (and the focused pane
-                        // no longer exists) — land focus on the (new) first pane.
-                        if first_sync
-                            && Some(pid) == this.workspace.active_project
-                            && let Some(iid) =
-                                this.workspace.project(pid).and_then(|p| p.first_instance())
-                        {
-                            this.focus_instance_with_attendance(iid, false, window, cx);
-                        }
-                        this.connect_host_projects(host_id, waiting, window, cx);
-                        cx.notify();
-                    }
-                    Err(e) => {
-                        this.remote_connecting.remove(&pid);
-                        let msg = format!("{e}");
-                        this.remote_connect_failed.insert(pid, msg.clone());
-                        // The projects waiting on this host fail with it — reported
-                        // once, below, not once per project.
-                        for (waiter, _) in
-                            this.host_connects
-                                .finish(host_id, turn, false, Instant::now())
-                        {
-                            this.remote_connecting.remove(&waiter);
-                            this.remote_connect_failed.insert(waiter, msg.clone());
-                        }
-                        let retry = SshRetry::ConnectProject(pid);
-                        if !this.handle_ssh_error(&msg, Some(&host_for_err), retry, cx) {
-                            // Drop a possibly-wrong session password so a retry
-                            // re-prompts. (A changed host key is NOT an auth
-                            // failure — the dialog path keeps the password.)
-                            this.session_passwords.remove(&owner_id);
-                            this.add_event(
-                                NotifKind::Error,
-                                tf(
-                                    "Couldn't connect to “{name}”",
-                                    &[("name", &name.to_string())],
-                                ),
-                                msg,
-                            );
-                        }
-                        cx.notify();
-                    }
-                });
-            })
-            .detach();
-            return;
-        }
-        // Local layout-synced project: its `.muxel/workspace.json` is on this machine,
-        // so reconcile it synchronously (a fast local read) before spawning panes.
-        if first_sync && !is_remote {
-            let _phase = ui_profile::phase("activation", "local-layout-sync", None);
-            let loc = self.repo_loc(pid);
-            let fetched = loc.as_ref().and_then(integrations::fetch_remote_layout);
-            let has_memory = loc.as_ref().is_some_and(integrations::memory_file_exists);
-            self.apply_remote_layout_sync(pid, fetched, has_memory, window, cx);
-        }
         if defer_spawns {
             self.spawn_project_terminals_deferred(pid, window, cx);
         } else {
@@ -6014,38 +4968,6 @@ impl MuxelApp {
         }
     }
 
-    /// A host's connection just came up: connect the projects that were waiting on
-    /// it, and retry the host's projects whose connect failed earlier — a connect
-    /// only fails when the host can't be reached, and now it can. All of them go
-    /// over the master the leading connect left warm.
-    fn connect_host_projects(
-        &mut self,
-        host_id: Uuid,
-        waiting: Vec<(Uuid, bool)>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let failed: Vec<Uuid> = self
-            .remote_connect_failed
-            .keys()
-            .copied()
-            .filter(|pid| {
-                self.remote_host_for_project(*pid)
-                    .is_some_and(|host| host.id == host_id)
-            })
-            .collect();
-        for (pid, defer_spawns) in waiting {
-            self.remote_connecting.remove(&pid);
-            self.ensure_project_terminals_with(pid, defer_spawns, window, cx);
-        }
-        for pid in failed {
-            self.reconnect_project(pid, window, cx);
-        }
-    }
-
-    /// The grid of a live terminal sharing this instance's pane (a sibling tab).
-    /// Tabs share a pane, so they share its bounds: this is exactly the size the new
-    /// pane will render at, known before it has ever been laid out.
     fn sibling_grid(&self, iid: Uuid, cx: &App) -> Option<(u16, u16)> {
         let project = self
             .workspace
@@ -6058,266 +4980,29 @@ impl MuxelApp {
             .map(|view| view.read(cx).session().size())
     }
 
-    /// Re-attach panes to muxel sessions still running on `pid`'s host that no
-    /// instance owns.
-    ///
-    /// A session is only ever reachable *through* an instance — muxel asks for it by
-    /// name — so an instance that goes away (closed, or lost with its workspace)
-    /// strands the agent still running inside it: invisible to muxel, and holding the
-    /// host's resources indefinitely. Opening the project adopts those back into
-    /// panes. `new-session -A` then attaches to the live session rather than starting
-    /// anything, so the agent is picked up mid-conversation, exactly where it was.
-    ///
-    /// Only muxel's own sessions, started in this project's tree, are ever taken —
-    /// see `tmux::orphan_sessions`.
-    fn adopt_remote_sessions(
-        &mut self,
-        pid: Uuid,
-        sessions: &[muxel_core::tmux::RemoteSession],
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(project) = self.workspace.project(pid) else {
-            return;
-        };
-        let Some(root) = project.remote.as_ref().map(|r| r.remote_root.clone()) else {
-            return;
-        };
-        let host_name = project
-            .remote
-            .as_ref()
-            .and_then(|r| self.remotes.iter().find(|h| h.id == r.host_id))
-            .map(|h| h.name.clone())
-            .unwrap_or_default();
-        let owned: Vec<String> = self
-            .workspace
-            .instances
-            .iter()
-            .filter(|i| i.project_id == pid)
-            .map(|i| muxel_core::tmux::session_for(i.tmux_session.as_deref(), &host_name, i.id))
-            .collect();
-        // A pane the user closed whose kill is still unconfirmed must not come back
-        // as a pane — `reap_closed_sessions` is still working on it.
-        let closed = project.closed_sessions.clone();
-
-        let orphans = muxel_core::tmux::orphan_sessions(sessions, &root, &owned, &closed);
-        if orphans.is_empty() {
-            return;
-        }
-        let adopted = orphans.len();
-        // Each adopted pane joins the project's existing pane as a tab. Without an
-        // anchor, `PlacementMode::Tab` has nothing to attach to: only the first
-        // (which seeds an empty project) would enter the layout, and the rest would
-        // exist as instances with a live terminal but no pane — invisible, while
-        // still holding a client on the session.
-        let mut anchor = self.workspace.project(pid).and_then(|p| p.first_instance());
-        for session in orphans {
-            // Come back as the agent that is actually running in there (`claude`,
-            // `zsh`, …), so the pane reads and behaves like the one that was lost.
-            let preset = self
-                .presets
-                .iter()
-                .find(|p| {
-                    p.kind == muxel_core::PresetKind::Terminal
-                        && p.program.as_deref() == Some(session.command.as_str())
-                })
-                .cloned()
-                .unwrap_or_else(AgentPreset::shell);
-            let mut instance = Instance::from_preset(pid, &preset);
-            // The binding that makes this an *adoption*: `place_and_spawn` keeps a
-            // pre-set session, and the launch resolves to it (`tmux::session_for`).
-            instance.tmux_session = Some(session.name.clone());
-            let iid = instance.id;
-            // Its worktree (if it had one) is the session's business, not ours — the
-            // pane attaches to a running shell, so muxel must not create one here.
-            self.place_and_spawn(
-                pid,
-                instance,
-                PlacementMode::Tab,
-                anchor,
-                Some(WorktreeChoice::None),
-                window,
-                cx,
-            );
-            // The first adopted pane seeds an empty project; the rest tab onto it.
-            anchor.get_or_insert(iid);
-        }
-        self.add_event(
-            NotifKind::Success,
-            tf(
-                "Attached {n} running session(s)",
-                &[("n", &adopted.to_string())],
-            ),
-            t("Agents were still running on the host with no pane — they're back.").to_string(),
-        );
-    }
-
-    /// Every tmux session muxel has launched, `(project, session, is_remote)` —
-    /// they survive a quit by design, so the quit dialog offers to kill them.
-    fn tmux_sessions(&self) -> Vec<(Uuid, String, bool)> {
+    fn tmux_sessions(&self) -> Vec<String> {
         self.workspace
             .instances
             .iter()
-            .filter_map(|i| {
-                let project = self.workspace.project(i.project_id)?;
-                let host = project
-                    .remote
-                    .as_ref()
-                    .and_then(|r| self.remotes.iter().find(|h| h.id == r.host_id));
-                match host {
-                    // A remote instance usually carries no *recorded* session — it
-                    // runs under tmux because its host defaults to it — so resolve the
-                    // name the pane was launched with rather than skipping it, which
-                    // would leave the session alive on the host forever.
-                    Some(host) if host.default_use_tmux || i.use_tmux => Some((
-                        i.project_id,
-                        muxel_core::tmux::session_for(i.tmux_session.as_deref(), &host.name, i.id),
-                        true,
-                    )),
-                    Some(_) => None,
-                    None => Some((i.project_id, i.tmux_session.clone()?, false)),
-                }
-            })
+            .filter_map(|i| i.tmux_session.clone())
             .collect()
     }
 
-    /// Kill muxel's tmux sessions in the chosen scopes, fire-and-forget: the
-    /// kill children outlive the app (remote ones ride the still-warm
-    /// ControlMaster), so quitting is never blocked on a slow host.
-    fn kill_tmux_sessions(&self, local: bool, remote: bool) {
-        for (pid, session, is_remote) in self.tmux_sessions() {
-            if is_remote && remote {
-                if let Some(host) = self.remote_host_for_project(pid) {
-                    let control_path = Self::control_path_for(host.id);
-                    let password = self.remote_password(&host);
-                    integrations::kill_remote_tmux_detached(
-                        &host,
-                        &control_path,
-                        password.as_deref(),
-                        &session,
-                    );
-                }
-            } else if !is_remote && local {
-                integrations::kill_local_tmux_detached(&session);
-            }
+    /// Kill muxel's tmux sessions, fire-and-forget: the kill children outlive the
+    /// app, so quitting is never blocked on a slow teardown.
+    fn kill_tmux_sessions(&self) {
+        for session in self.tmux_sessions() {
+            integrations::kill_local_tmux_detached(&session);
         }
     }
 
-    /// Quit-dialog cleanup per the two checkboxes.
+    /// Quit-dialog cleanup: kill the local tmux sessions if the box was checked.
     fn kill_checked_tmux_sessions(&self) {
-        if self.quit_kill_tmux_local || self.quit_kill_tmux_remote {
-            self.kill_tmux_sessions(self.quit_kill_tmux_local, self.quit_kill_tmux_remote);
+        if self.quit_kill_tmux_local {
+            self.kill_tmux_sessions();
         }
     }
 
-    /// Retry a remote project's connection: clears the failure state and re-runs
-    /// the connect pre-flight (which respawns the panes on success).
-    fn reconnect_project(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        self.remote_connect_failed.remove(&pid);
-        // Force the layout re-sync too — a long outage may have left the remote
-        // copy newer than ours.
-        self.remote_synced.remove(&pid);
-        self.ensure_project_terminals_deferred(pid, window, cx);
-        cx.notify();
-    }
-
-    /// Open the new-remote-project wizard preset to `host_id` and immediately
-    /// kick off its "Scan for projects" (the reconnect state's second action).
-    fn open_remote_scan(&mut self, host_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_new_remote = true;
-        self.nr_host = Some(host_id);
-        self.nr_verify = RemoteTestState::Idle;
-        self.nr_scan = RemoteScanState::Idle;
-        self.nr_dir.update(cx, |s, cx| s.set_value("", window, cx));
-        self.nr_name.update(cx, |s, cx| s.set_value("", window, cx));
-        self.scan_remote_dirs(window, cx);
-        cx.notify();
-    }
-
-    /// Whether any of a project's panes has a live view (terminal/editor/browser).
-    fn project_has_live_panes(&self, pid: Uuid) -> bool {
-        self.workspace
-            .project(pid)
-            .map(|p| p.instances())
-            .unwrap_or_default()
-            .iter()
-            .any(|iid| {
-                self.terminals.contains_key(iid)
-                    || self.editors.contains_key(iid)
-                    || self.browsers.contains_key(iid)
-            })
-    }
-
-    /// The pane-area state for a remote project whose connection failed: the
-    /// error + Reconnect and Scan-for-projects actions.
-    fn render_remote_connect_failed(
-        &self,
-        pid: Uuid,
-        msg: &str,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let host = self.remote_host_for_project(pid);
-        let host_name = host.as_ref().map(|h| h.name.clone()).unwrap_or_default();
-        let host_id = host.as_ref().map(|h| h.id);
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_3()
-            .p_4()
-            .child(
-                div()
-                    .text_lg()
-                    .font_semibold()
-                    .child(tf("Couldn't connect to “{name}”", &[("name", &host_name)])),
-            )
-            .child(
-                div()
-                    .max_w(px(560.0))
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(msg.to_string()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        Button::new("remote-reconnect")
-                            .primary()
-                            .icon(IconName::Redo)
-                            .label(t("Reconnect"))
-                            .on_click(cx.listener(move |this, _e, window, cx| {
-                                this.reconnect_project(pid, window, cx)
-                            })),
-                    )
-                    .children(host_id.map(|hid| {
-                        Button::new("remote-scan")
-                            .ghost()
-                            .icon(IconName::Search)
-                            .label(t("Scan for projects"))
-                            .on_click(cx.listener(move |this, _e, window, cx| {
-                                this.open_remote_scan(hid, window, cx)
-                            }))
-                    })),
-            )
-            .into_any_element()
-    }
-
-    /// The configured remote host for a project, if any — with any referenced login
-    /// identity's credentials already overlaid ([`RemoteHost::effective`]).
-    fn remote_host_for_project(&self, pid: Uuid) -> Option<RemoteHost> {
-        let r = self.workspace.project(pid)?.remote.as_ref()?;
-        self.remotes
-            .iter()
-            .find(|h| h.id == r.host_id)
-            .map(|h| h.effective(&self.identities))
-    }
-
-    /// Spawn any missing terminals/editors for a project's panes (no remote
-    /// pre-flight — call [`Self::ensure_project_terminals`] for that).
     fn spawn_project_terminals_now(
         &mut self,
         pid: Uuid,
@@ -6825,239 +5510,6 @@ impl MuxelApp {
         pid
     }
 
-    /// Create a project that lives on a remote host (over SSH). `root_path` is set
-    /// cosmetically to the remote path; the real working dir comes from the
-    /// [`RemoteRef`].
-    fn create_remote_project_at(
-        &mut self,
-        host_id: Uuid,
-        remote_dir: String,
-        name: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Uuid {
-        let mut project = Project::new(name, PathBuf::from(&remote_dir));
-        project.remote = Some(RemoteRef {
-            host_id,
-            remote_root: remote_dir,
-        });
-        let pid = project.id;
-        let preset = self.current_agent_preset();
-        let instance = Instance::from_preset(pid, &preset);
-        let iid = instance.id;
-        project.layout = Some(PaneNode::leaf(iid));
-
-        self.workspace.add_instance(instance);
-        self.workspace.add_project(project);
-        self.workspace.active_project = Some(pid);
-        // Point the open file browser at the new project right away.
-        if self.show_file_browser {
-            self.load_file_browser(pid, cx);
-        }
-
-        // Goes through the remote pre-flight (password prompt + login check).
-        self.ensure_project_terminals(pid, window, cx);
-        self.focus_instance(iid, window, cx);
-        self.persist();
-        cx.notify();
-        pid
-    }
-
-    /// Open the new-remote-project wizard (defaults the host to the first saved).
-    fn open_remote_project_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_new_remote = true;
-        self.nr_host = self.remotes.first().map(|h| h.id);
-        self.nr_verify = RemoteTestState::Idle;
-        self.nr_scan = RemoteScanState::Idle;
-        self.nr_dir.update(cx, |s, cx| s.set_value("", window, cx));
-        self.nr_name.update(cx, |s, cx| s.set_value("", window, cx));
-        cx.notify();
-    }
-
-    fn close_remote_project_modal(&mut self, cx: &mut Context<Self>) {
-        self.show_new_remote = false;
-        cx.notify();
-    }
-
-    /// From the "New remote project" dialog: jump to Settings → Remotes with a
-    /// fresh host editor open, so a host can be added without hunting for it.
-    fn open_add_remote_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_remote_project_modal(cx);
-        if !self.show_settings {
-            self.toggle_settings(window, cx);
-        }
-        self.set_section(SettingsSection::Remotes, cx);
-        self.add_remote(window, cx);
-    }
-
-    /// Verify the chosen remote directory exists (background + toast).
-    fn verify_remote_dir(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(host) = self
-            .nr_host
-            .and_then(|id| self.remotes.iter().find(|h| h.id == id))
-            .map(|h| h.effective(&self.identities))
-        else {
-            return;
-        };
-        let dir = self.nr_dir.read(cx).value().trim().to_string();
-        if dir.is_empty() {
-            return;
-        }
-        let password = self.remote_password(&host);
-        // Can't verify a password host without a password (none saved/in session).
-        if host.auth == SshAuth::Password && password.is_none() {
-            self.nr_verify = RemoteTestState::Failed(
-                t("Save a password for this host (or connect once) to verify.").into(),
-            );
-            cx.notify();
-            return;
-        }
-        let control_path = Self::control_path_for(host.id);
-        // Inline result shown above the wizard buttons (not a sidebar event).
-        self.nr_verify = RemoteTestState::Testing;
-        cx.notify();
-        let host_for_err = host.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let res = cx
-                .background_executor()
-                .spawn(async move {
-                    integrations::ssh_test_dir(&host, &control_path, password.as_deref(), &dir)
-                        .map(|()| dir)
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.nr_verify = match res {
-                    Ok(dir) => RemoteTestState::Ok(tf("Found {dir}", &[("dir", &dir.to_string())])),
-                    Err(e) => {
-                        let msg = format!("{e}");
-                        if this.handle_ssh_error(
-                            &msg,
-                            Some(&host_for_err),
-                            SshRetry::VerifyRemoteDir,
-                            cx,
-                        ) {
-                            RemoteTestState::Failed(t("Host key changed — see dialog").into())
-                        } else {
-                            RemoteTestState::Failed(msg)
-                        }
-                    }
-                };
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// Scan the chosen host for existing muxel projects (background), then show
-    /// the found roots as clickable rows the user can pick to fill the inputs.
-    fn scan_remote_dirs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(host) = self
-            .nr_host
-            .and_then(|id| self.remotes.iter().find(|h| h.id == id))
-            .map(|h| h.effective(&self.identities))
-        else {
-            return;
-        };
-        let password = self.remote_password(&host);
-        // Can't scan a password host without a password (none saved/in session).
-        if host.auth == SshAuth::Password && password.is_none() {
-            self.nr_scan = RemoteScanState::Failed(
-                t("Save a password for this host (or connect once) to scan.").into(),
-            );
-            cx.notify();
-            return;
-        }
-        let control_path = Self::control_path_for(host.id);
-        self.nr_scan = RemoteScanState::Scanning;
-        cx.notify();
-        let host_for_err = host.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let res = cx
-                .background_executor()
-                .spawn(async move {
-                    integrations::scan_remote_projects(&host, &control_path, password.as_deref())
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.nr_scan = match res {
-                    Ok(roots) => RemoteScanState::Found(roots),
-                    Err(e) => {
-                        let msg = format!("{e}");
-                        if this.handle_ssh_error(
-                            &msg,
-                            Some(&host_for_err),
-                            SshRetry::ScanRemoteDirs,
-                            cx,
-                        ) {
-                            RemoteScanState::Failed(t("Host key changed — see dialog").into())
-                        } else {
-                            RemoteScanState::Failed(msg)
-                        }
-                    }
-                };
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// Fill the wizard inputs from a scanned root so the user can Create it. The
-    /// root is known to exist (it has a `.muxel/workspace.json`), so mark Verify OK.
-    fn pick_scanned_root(&mut self, root: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.nr_dir
-            .update(cx, |s, cx| s.set_value(root, window, cx));
-        let name = root
-            .trim_end_matches('/')
-            .rsplit('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("remote");
-        self.nr_name
-            .update(cx, |s, cx| s.set_value(name, window, cx));
-        self.nr_verify = RemoteTestState::Ok(tf("Found {dir}", &[("dir", root)]));
-        cx.notify();
-    }
-
-    /// Create the remote project from the wizard inputs.
-    fn confirm_remote_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(host_id) = self.nr_host else {
-            return;
-        };
-        let dir = self.nr_dir.read(cx).value().trim().to_string();
-        if dir.is_empty() {
-            return;
-        }
-        // Refuse a second copy of an open project; keep the wizard up to say why.
-        let os = self
-            .remotes
-            .iter()
-            .find(|h| h.id == host_id)
-            .map(|h| h.os)
-            .unwrap_or_default();
-        if let Some(open) = self.workspace.remote_project_at(host_id, &dir, os) {
-            self.nr_verify = RemoteTestState::Failed(tf(
-                "“{name}” is already open in this workspace.",
-                &[("name", &open.name)],
-            ));
-            cx.notify();
-            return;
-        }
-        let mut name = self.nr_name.read(cx).value().trim().to_string();
-        if name.is_empty() {
-            // Default to the remote directory's last component.
-            name = dir
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("remote")
-                .to_string();
-        }
-        self.show_new_remote = false;
-        self.create_remote_project_at(host_id, dir, name, window, cx);
-    }
-
-    /// Open a native folder picker, then create a project rooted at the choice.
     fn new_project_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -7121,12 +5573,6 @@ impl MuxelApp {
         }
         // Leaving a remote project with a pending layout change → flush it now so
         // the remote copy is current even if we don't return for a while.
-        if let Some(prev) = self.workspace.active_project
-            && prev != pid
-            && self.remote_push_due.remove(&prev).is_some()
-        {
-            self.push_remote_layout_now(prev, window, cx);
-        }
         self.workspace.active_project = Some(pid);
         // Adopt the project's default preset as the current selection.
         if let Some(def) = self.workspace.project(pid).and_then(|p| p.default_preset)
@@ -7449,7 +5895,7 @@ impl MuxelApp {
             GitSource::Worktree(wid) => self
                 .workspace
                 .worktree(wid)
-                .map(|w| integrations::RepoLoc::Local(w.path.clone())),
+                .map(|w| integrations::RepoLoc::new(w.path.clone())),
         }
     }
 
@@ -7647,7 +6093,7 @@ impl MuxelApp {
                         .map(|(wid, path)| {
                             (
                                 wid,
-                                integrations::git_status_files(&integrations::RepoLoc::Local(path)),
+                                integrations::git_status_files(&integrations::RepoLoc::new(path)),
                             )
                         })
                         .collect();
@@ -7713,9 +6159,7 @@ impl MuxelApp {
                     }
                     Err(e) => {
                         let msg = format!("{e}");
-                        if !this.handle_ssh_error(&msg, None, SshRetry::None, cx) {
-                            this.add_event(NotifKind::Error, t("Merge failed").to_string(), msg);
-                        }
+                        this.add_event(NotifKind::Error, t("Merge failed").to_string(), msg);
                     }
                 }
                 cx.notify();
@@ -7777,8 +6221,6 @@ impl MuxelApp {
             runners: self.runners.clone(),
             snippets: self.snippets.clone(),
             loops: self.loops.clone(),
-            remotes: self.remotes.clone(),
-            identities: self.identities.clone(),
             theme: self.theme.clone(),
             theme_mode: self.theme_mode.clone(),
             ..self.settings.clone()
@@ -7801,126 +6243,6 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// Open the update modal, kicking off a check if none has run yet.
-    fn open_update_modal(&mut self, cx: &mut Context<Self>) {
-        self.show_update_modal = true;
-        if matches!(self.update_state, UpdateState::Idle) {
-            self.check_for_updates(cx);
-        } else {
-            cx.notify();
-        }
-    }
-
-    /// Whether a newer release is available, downloading, or staged.
-    fn update_pending(&self) -> bool {
-        matches!(
-            self.update_state,
-            UpdateState::Available(_) | UpdateState::Downloading | UpdateState::Ready(_)
-        )
-    }
-
-    /// Query GitHub for a newer release (off the UI thread). Fires a desktop
-    /// notification when one is found.
-    fn check_for_updates(&mut self, cx: &mut Context<Self>) {
-        if matches!(
-            self.update_state,
-            UpdateState::Checking | UpdateState::Downloading
-        ) {
-            return;
-        }
-        self.update_state = UpdateState::Checking;
-        cx.notify();
-        let notify_enabled = self.notifications_enabled;
-        cx.spawn(async move |view: WeakEntity<Self>, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { crate::update::fetch_latest() })
-                .await;
-            let _ = view.update(cx, |this, cx| {
-                match result {
-                    Ok(Some(info)) => {
-                        if notify_enabled {
-                            notify(
-                                tf(
-                                    "muxel {version} is available",
-                                    &[("version", &info.version.to_string())],
-                                ),
-                                t("Open muxel to install the update.").to_string(),
-                                None,
-                            );
-                        }
-                        this.update_state = UpdateState::Available(info);
-                    }
-                    Ok(None) => this.update_state = UpdateState::UpToDate,
-                    Err(e) => {
-                        log::warn!("update check failed: {e}");
-                        this.update_state = UpdateState::Error(e.to_string());
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// Download the matching release asset and apply it (off the UI thread).
-    fn start_update_download(&mut self, cx: &mut Context<Self>) {
-        let kind = self.install_kind;
-        let url = match &self.update_state {
-            UpdateState::Available(info) => match crate::update::asset_for(kind, &info.assets) {
-                Some((_, url)) => url.clone(),
-                // No asset matched this platform/arch — surface it instead of
-                // leaving the button looking dead.
-                None => {
-                    self.update_state = UpdateState::Error(
-                        t("No matching download for this platform. Use the releases page to update manually.")
-                            .to_string(),
-                    );
-                    cx.notify();
-                    return;
-                }
-            },
-            _ => return,
-        };
-        self.update_state = UpdateState::Downloading;
-        cx.notify();
-        let notify_enabled = self.notifications_enabled;
-        cx.spawn(async move |view: WeakEntity<Self>, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { crate::update::download_and_apply(kind, &url) })
-                .await;
-            let _ = view.update(cx, |this, cx| {
-                match result {
-                    Ok(plan) => {
-                        if notify_enabled {
-                            notify(
-                                t("muxel update ready").to_string(),
-                                t("Restart to finish updating.").to_string(),
-                                None,
-                            );
-                        }
-                        this.update_state = UpdateState::Ready(plan);
-                    }
-                    Err(e) => {
-                        log::warn!("update download failed: {e}");
-                        this.update_state = UpdateState::Error(e.to_string());
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// Relaunch into the freshly-installed version (never returns on success).
-    fn apply_update_restart(&mut self, _cx: &mut Context<Self>) {
-        if let UpdateState::Ready(plan) = &self.update_state {
-            crate::update::relaunch_and_exit(plan);
-        }
-    }
-
-    /// Refresh program availability + cached git status (installed agents, `gh`,
     /// `sshpass`, project branches, worktree change counts) **off the UI thread**.
     /// These do `$PATH` scans and a `git` subprocess per local project/worktree —
     /// far too slow to run synchronously every tick (it stutters window drags) —
@@ -7944,7 +6266,6 @@ impl MuxelApp {
             .workspace
             .projects
             .iter()
-            .filter(|p| !p.is_remote())
             .map(|p| (p.id, p.root_path.clone()))
             .collect();
         let worktrees: Vec<(Uuid, PathBuf)> = self
@@ -7960,10 +6281,7 @@ impl MuxelApp {
             .any(|instance| {
                 instance.session_id.is_some()
                     && is_codex_program(instance.program.as_deref())
-                    && self
-                        .workspace
-                        .project(instance.project_id)
-                        .is_some_and(|project| !project.is_remote())
+                    && self.workspace.project(instance.project_id).is_some()
             })
             .then(home_dir)
             .flatten();
@@ -7978,7 +6296,7 @@ impl MuxelApp {
                     let branches: Vec<(Uuid, Option<String>, Vec<String>)> = locals
                         .into_iter()
                         .map(|(id, root)| {
-                            let loc = integrations::RepoLoc::Local(root);
+                            let loc = integrations::RepoLoc::new(root);
                             (
                                 id,
                                 integrations::repo_current_branch(&loc),
@@ -8023,11 +6341,7 @@ impl MuxelApp {
                     .instances
                     .iter()
                     .filter_map(|instance| {
-                        let remote = this
-                            .workspace
-                            .project(instance.project_id)
-                            .is_some_and(Project::is_remote);
-                        codex_session_auto_title(instance, &this.codex_session_names, remote)
+                        codex_session_auto_title(instance, &this.codex_session_names, false)
                             .map(|name| (instance.id, name))
                     })
                     .collect();
@@ -8046,278 +6360,6 @@ impl MuxelApp {
         .detach();
     }
 
-    /// Refresh the branch label for remote projects off the UI thread (their git
-    /// runs over SSH, reusing the pane's ControlMaster — no keychain read here).
-    fn poll_remote_branches(&mut self, cx: &mut Context<Self>) {
-        let jobs: Vec<(Uuid, integrations::RepoLoc)> = self
-            .workspace
-            .projects
-            .iter()
-            .filter_map(|p| {
-                let r = p.remote.as_ref()?;
-                let host = self
-                    .remotes
-                    .iter()
-                    .find(|h| h.id == r.host_id)?
-                    .effective(&self.identities);
-                Some((
-                    p.id,
-                    integrations::RepoLoc::remote(
-                        host,
-                        r.remote_root.clone(),
-                        Self::control_path_for(r.host_id),
-                        None,
-                    ),
-                ))
-            })
-            .collect();
-        if jobs.is_empty() {
-            return;
-        }
-        cx.spawn(async move |this, cx| {
-            let results = cx
-                .background_executor()
-                .spawn(async move {
-                    jobs.into_iter()
-                        .map(|(pid, loc)| {
-                            let branch = integrations::repo_current_branch(&loc);
-                            let branches = integrations::list_branches(&loc);
-                            (pid, branch, branches)
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                for (pid, branch, branches) in results {
-                    this.project_branches.insert(pid, branch);
-                    this.project_branch_lists.insert(pid, branches);
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// Re-fetch the shared `.muxel/workspace.json` for each already-reconciled synced
-    /// project, off the UI thread, and apply a peer's changes live (see
-    /// `poll_peer_layout`). Runs on the same ~5s throttle as branch polling — the
-    /// live counterpart to the connect-time `apply_remote_layout_sync`.
-    fn fetch_remote_layouts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let synced: Vec<Uuid> = self.remote_synced.iter().copied().collect();
-        let jobs: Vec<(Uuid, integrations::RepoLoc)> = synced
-            .into_iter()
-            .filter(|pid| self.project_syncs_layout(*pid))
-            // Mid-push, the file may be half written; the next poll reads it whole.
-            .filter(|pid| !self.remote_push_inflight.contains(pid))
-            .filter_map(|pid| self.repo_loc(pid).map(|loc| (pid, loc)))
-            .collect();
-        if jobs.is_empty() {
-            return;
-        }
-        cx.spawn_in(window, async move |this, cx| {
-            let results = cx
-                .background_executor()
-                .spawn(async move {
-                    jobs.into_iter()
-                        .map(|(pid, loc)| (pid, integrations::fetch_remote_layout(&loc)))
-                        .collect::<Vec<_>>()
-                })
-                .await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                for (pid, json) in results {
-                    if let Some(json) = json {
-                        this.poll_peer_layout(pid, &json, window, cx);
-                    }
-                }
-            });
-        })
-        .detach();
-    }
-
-    /// Act on one polled layout file: adopt a peer's write, or just note that the
-    /// file already matches this machine (see `muxel_core::peer_layout_action`).
-    fn poll_peer_layout(
-        &mut self,
-        pid: Uuid,
-        json: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(proj) = self.workspace.project(pid) else {
-            return;
-        };
-        let layout_root = match &proj.remote {
-            Some(r) => r.remote_root.clone(),
-            None => proj.root_path.display().to_string(),
-        };
-        let Some(remote) = RemoteLayout::parse(json, &layout_root) else {
-            return;
-        };
-        let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
-        let local_key = RemoteLayout::capture(proj, &self.workspace, now_epoch).content_key();
-        let local_rev = proj.layout_updated_at.unwrap_or(0);
-        let remote_key = remote.content_key();
-        match muxel_core::peer_layout_action(
-            &remote_key,
-            remote.updated_at,
-            self.layout_synced_keys.get(&pid).map(String::as_str),
-            &local_key,
-            local_rev,
-        ) {
-            muxel_core::PeerLayoutAction::Ignore => {}
-            muxel_core::PeerLayoutAction::InSync => {
-                self.layout_synced_keys.insert(pid, remote_key);
-            }
-            muxel_core::PeerLayoutAction::Adopt => self.adopt_peer_layout(pid, remote, window, cx),
-        }
-    }
-
-    /// Apply a peer's layout live, in place: panes it added appear (attached to their
-    /// running tmux sessions), panes it closed go away, and every pane both sides
-    /// share keeps its live terminal. Unlike the connect-time
-    /// [`Self::pull_remote_layout`] nothing is torn down and respawned, so a peer
-    /// starting one agent never interrupts the others.
-    fn adopt_peer_layout(
-        &mut self,
-        pid: Uuid,
-        remote: RemoteLayout,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(project) = self.workspace.project(pid) else {
-            return;
-        };
-        let name = project.name.clone();
-        let before = project.instances();
-        let local: Vec<Instance> = before
-            .iter()
-            .filter_map(|id| self.workspace.instance(*id).cloned())
-            .collect();
-        let remote_key = remote.content_key();
-        let RemoteLayout {
-            layout,
-            instances,
-            worktrees,
-            updated_at,
-            memory_enabled,
-            ..
-        } = remote;
-        let mut instances = muxel_core::merge_peer_instances(&local, instances, pid);
-        self.bind_peer_sessions(pid, &mut instances);
-        let keep: HashSet<Uuid> = instances.iter().map(|i| i.id).collect();
-        let closed: Vec<Uuid> = before
-            .iter()
-            .copied()
-            .filter(|id| !keep.contains(id))
-            .collect();
-        let added = instances.iter().filter(|i| !before.contains(&i.id)).count();
-        // A pane the peer closed: drop only this side's view. Closing it on the peer
-        // already tore down its tmux session and worktree.
-        self.release_maximize(&closed);
-        for &iid in &closed {
-            ui_profile::unregister_focus_pane(iid);
-            self.terminal_launching.remove(&iid);
-            self.clear_notifications_for(iid);
-            if let Some(view) = self.terminals.remove(&iid) {
-                view.read(cx).session().kill();
-            }
-            self.editors.remove(&iid);
-            self.browsers.remove(&iid);
-            self.last_status.remove(&iid);
-            self.failed_launches.remove(&iid);
-            self.workspace.remove_instance_meta(iid);
-        }
-        for instance in instances {
-            self.workspace.remove_instance_meta(instance.id);
-            self.workspace.add_instance(instance);
-        }
-        for mut wt in worktrees {
-            wt.project_id = pid;
-            self.workspace.remove_worktree_meta(wt.id);
-            self.workspace.add_worktree(wt);
-        }
-        if let Some(p) = self.workspace.project_mut(pid) {
-            p.layout = layout;
-            p.layout_updated_at = Some(updated_at);
-            if let Some(enabled) = memory_enabled {
-                p.memory_enabled = enabled;
-            }
-        }
-        self.seed_adopted_layout(pid, remote_key);
-        if self.active_instance.is_some_and(|a| closed.contains(&a)) {
-            self.active_instance = self
-                .workspace
-                .project(pid)
-                .and_then(|p| p.preferred_instance());
-        }
-        self.persist();
-        muxel_store::append_event_log(&format!(
-            "layout: adopted peer layout for \"{name}\" (+{added} -{})",
-            closed.len()
-        ));
-        // The peer's new panes attach to their sessions (`tmux new-session -A`).
-        self.spawn_project_terminals_now(pid, window, cx);
-        cx.notify();
-    }
-
-    /// After adopting a peer's layout: re-seed change detection so the adoption
-    /// isn't pushed straight back, and remember the file as synced. Whatever this
-    /// machine had to add (a session binding the peer never recorded) makes the
-    /// content differ from the file; that is pushed, so the peer learns it too —
-    /// under the adopted revision, not a new one. It is bookkeeping, not an edit:
-    /// stamped as newer, it would beat a change the peer made meanwhile (moving the
-    /// very pane that was just bound), and the push would snap that pane back.
-    fn seed_adopted_layout(&mut self, pid: Uuid, remote_key: String) {
-        let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
-        let Some(p) = self.workspace.project(pid) else {
-            return;
-        };
-        let doc = RemoteLayout::capture(p, &self.workspace, now_epoch);
-        let key = doc.content_key();
-        self.remote_push_due.remove(&pid);
-        if key != remote_key {
-            self.remote_push_due
-                .insert(pid, Instant::now() + Duration::from_secs(2));
-        }
-        self.layout_keys.insert(pid, key);
-        self.layout_edit_keys.insert(pid, doc.edit_key());
-        self.layout_synced_keys.insert(pid, remote_key);
-    }
-
-    /// Bind a local project's terminal panes that a peer created without recording
-    /// a tmux session (another desktop relying on its host's tmux default) to the
-    /// session they actually run in, found by pane id — so this machine attaches to
-    /// that agent instead of launching a second one beside it. With no such session
-    /// running, the pane gets this project's canonical name and starts there.
-    fn bind_peer_sessions(&self, pid: Uuid, instances: &mut [Instance]) {
-        if !self.tmux_available {
-            return;
-        }
-        let Some(project) = self.workspace.project(pid).filter(|p| p.remote.is_none()) else {
-            return;
-        };
-        let unbound = |i: &Instance| {
-            i.kind == InstanceKind::Terminal
-                && i.tmux_session
-                    .as_deref()
-                    .is_none_or(|s| s.trim().is_empty())
-        };
-        if !instances.iter().any(unbound) {
-            return;
-        }
-        let sessions = integrations::list_local_tmux_sessions().unwrap_or_default();
-        for instance in instances.iter_mut().filter(|i| unbound(i)) {
-            let session = muxel_core::tmux::session_by_suffix(&sessions, instance.id)
-                .map(|s| s.name.clone())
-                .unwrap_or_else(|| muxel_core::tmux::session_name(&project.name, instance.id));
-            instance.tmux_session = Some(session);
-            instance.use_tmux = true;
-        }
-    }
-
-    /// Adopt the exact Claude conversation selected by an in-process `/resume`.
-    /// The hook record is keyed by pane id and accepted only when its UUID,
-    /// transcript path, and cwd all agree with Claude's own on-disk transcript.
     fn adopt_claude_session_binding(&mut self, iid: Uuid, cwd: &std::path::Path) -> bool {
         let (Some(data_dir), Some(home)) = (muxel_store::data_dir(), home_dir()) else {
             return false;
@@ -8380,7 +6422,7 @@ impl MuxelApp {
             .iter()
             .filter_map(|instance| {
                 let project = self.workspace.project(instance.project_id)?;
-                if project.remote.is_some() || !is_claude_program(instance.program.as_deref()) {
+                if !is_claude_program(instance.program.as_deref()) {
                     return None;
                 }
                 let cwd = instance
@@ -8519,14 +6561,10 @@ impl MuxelApp {
             let Some(instance) = self.workspace.instance(iid) else {
                 continue;
             };
-            let remote = self
-                .workspace
-                .project(instance.project_id)
-                .is_some_and(Project::is_remote);
             let name = authoritative_terminal_auto_title(
                 instance,
                 &self.codex_session_names,
-                remote,
+                false,
                 name.as_deref(),
             );
             let Some(name) = name else {
@@ -8596,12 +6634,6 @@ impl MuxelApp {
         // Program availability (installed agents / gh / sshpass) + git status are
         // refreshed off the UI thread so they don't stutter the render loop.
         self.refresh_status(cx);
-        // Throttle remote (ssh) branch polling + layout re-fetch to every ~5s.
-        if self.remote_poll_count == 0 {
-            self.poll_remote_branches(cx);
-            self.fetch_remote_layouts(window, cx);
-        }
-        self.remote_poll_count = (self.remote_poll_count + 1) % 5;
         // Session switches happen inside Grok without replacing the PTY child.
         // Poll independently of the slower remote-project cadence so a normal
         // quit shortly after `/resume` is unlikely to persist the old binding.
@@ -8703,8 +6735,6 @@ impl MuxelApp {
 
         let mut to_close = Vec::new();
         let mut to_recover: Vec<(Uuid, String)> = Vec::new();
-        // Agents that just finished, whose replies auto-read should speak.
-        let mut to_read_aloud: Vec<Uuid> = Vec::new();
         // (instance, title, signal name) — panes to reattach to a live tmux session.
         let mut to_reattach: Vec<(Uuid, String, String)> = Vec::new();
         // Only re-render when something visible actually changed. Re-rendering
@@ -8746,9 +6776,6 @@ impl MuxelApp {
                     .and_then(|pid| self.presets.iter().find(|p| p.id == pid))
                     .or_else(|| self.presets.iter().find(|p| p.name == inst.preset))?;
                 let project = self.workspace.project(inst.project_id)?;
-                if project.remote.is_some() {
-                    return None;
-                }
                 let cwd = inst
                     .worktree_path
                     .as_deref()
@@ -8875,13 +6902,6 @@ impl MuxelApp {
             // new event. Do not notify again for a saved completion/block.
             let restored_transition =
                 is_restored_transition(preserve_restored, status, restored_state);
-            if changed
-                && status == AgentStatus::Done
-                && !restored_transition
-                && self.auto_read_wanted(iid, pane_active)
-            {
-                to_read_aloud.push(iid);
-            }
             if changed && !attended && !restored_transition {
                 let kind = match status {
                     AgentStatus::Blocked => Some(NotifKind::Blocked),
@@ -9005,28 +7025,13 @@ impl MuxelApp {
             // the session and the agent relaunches with `--resume <id>`, restoring the
             // conversation from its transcript — the tmux scrollback is the only
             // casualty. Resetting the id would throw the conversation away.
-            let is_remote = self.remote_host_for_instance(iid).is_some();
             // Announce the drop once per outage, not on every retry. The count is
             // this outage's attempt tally, which backs off the next retry; it is
             // cleared when the pane settles (or the terminal goes away).
             let attempts = self.reconnecting.entry(iid).or_default();
             let first_drop = *attempts == 0;
             *attempts += 1;
-            if is_remote {
-                // The tmux session lives on the host and outlives a dropped relay, so
-                // `tmux_session_exists` (a *local* check) is meaningless here — never
-                // claim the session was lost. The pane shows "reconnecting…" until
-                // this respawn's `tmux new-session -A` reattaches it.
-                if first_drop {
-                    self.add_event(
-                        NotifKind::Blocked,
-                        tf("{title}: connection lost — reconnecting…", &[("title", &title)]),
-                        t("The tmux session is still running on the host; muxel will reattach as soon as it's reachable.")
-                            .to_string(),
-                    );
-                    muxel_store::append_event_log(&format!("reconnect: \"{title}\" [{session}]"));
-                }
-            } else if first_drop {
+            if first_drop {
                 // Local pane: the local has-session check is correct.
                 let alive = integrations::tmux_session_exists(&session);
                 let (heading, detail) = if alive {
@@ -9080,10 +7085,6 @@ impl MuxelApp {
             self.close_instance_inner(iid, "auto-close (exit)", cx); // re-renders on its own
         }
 
-        for iid in to_read_aloud {
-            self.enqueue_read_aloud(iid, cx);
-        }
-
         if activity_changed {
             self.persist();
         }
@@ -9095,11 +7096,8 @@ impl MuxelApp {
         self.exit_logged.retain(|iid| live.contains(iid));
         self.reconnecting.retain(|iid, _| live.contains(iid));
         self.auto.retain(|iid, _| live.contains(iid));
-        self.readings.retain(&live);
         // Auto-continue: nudge armed panes whose agent has stalled with work left.
         self.tick_auto_continue(cx);
-        // Sync remote projects' layouts to their hosts (change-detect + debounce).
-        self.tick_remote_sync(window, cx);
         if dirty {
             if let Some(generation) = status_notify_generation {
                 ui_profile::status_dirty_root_notify(generation, status_transition_count);
@@ -10236,9 +8234,6 @@ impl MuxelApp {
             &self.broadcast_input,
             &self.dispose_commit_input,
             &self.git_action_input,
-            &self.nr_dir,
-            &self.nr_name,
-            &self.password_prompt_input,
             &self.runner_input,
             &self.search_input,
             &self.find_input,
@@ -10302,22 +8297,18 @@ impl MuxelApp {
 
     /// Any overlay that draws above the pane area. The native browser webviews
     /// float above ALL gpui content, so they must hide beneath these.
-    /// NOTE: every new modal/palette/menu flag MUST be added here (see CLAUDE.md).
+    /// NOTE: every new modal/palette/menu flag MUST be added here (see AGENTS.md).
     fn any_overlay_open(&self, cx: &App) -> bool {
         self.show_settings
             || self.show_search_palette
             || self.show_find_panel
-            || self.show_update_modal
             || self.show_quit_confirm
             || self.show_keys
             || self.show_terms
             || self.show_workspace_selector
-            || self.show_new_remote
             || self.show_run_dialog
             || self.broadcasting
-            || self.stt_state != SttState::Idle
             || self.git_modal.is_some()
-            || self.password_prompt.is_some()
             || self.confirm.is_some()
             || self.place_menu.is_some()
             || self.runners_menu.is_some()
@@ -10454,11 +8445,7 @@ impl MuxelApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Uuid> {
-        let path = if self.workspace.project(pid).is_some_and(|p| p.is_remote()) {
-            path
-        } else {
-            path.map(|path| std::fs::canonicalize(&path).unwrap_or(path))
-        };
+        let path = path.map(|path| std::fs::canonicalize(&path).unwrap_or(path));
         // Reuse an already-open editor for this exact path.
         if let Some(p) = &path
             && let Some(iid) = self
@@ -10482,23 +8469,6 @@ impl MuxelApp {
         self.editors.insert(iid, ed.clone());
         // Remote project: the local read in `EditorView::open` finds nothing, so
         // fetch the file's contents over SSH (background) and fill the editor.
-        if let Some(p) = &path
-            && self.workspace.project(pid).is_some_and(|pr| pr.is_remote())
-            && let Some(loc) = self.repo_loc(pid)
-        {
-            let abs = p.to_string_lossy().into_owned();
-            let ed = ed.clone();
-            cx.spawn_in(window, async move |_this, cx| {
-                let content = cx
-                    .background_executor()
-                    .spawn(async move { integrations::read_remote_file(&loc, &abs) })
-                    .await;
-                if let Some(text) = content {
-                    let _ = ed.update_in(cx, |e, window, cx| e.set_content(text, window, cx));
-                }
-            })
-            .detach();
-        }
         self.focus_instance(iid, window, cx);
         self.persist();
         cx.notify();
@@ -10668,7 +8638,7 @@ impl MuxelApp {
                     .workspace
                     .instance(iid)
                     .and_then(|instance| self.workspace.project(instance.project_id))
-                    .is_some_and(|project| !project.is_remote());
+                    .is_some();
                 let editor = editor.read(cx);
                 (local && editor.is_pollable_text()).then(|| {
                     (
@@ -10807,17 +8777,7 @@ impl MuxelApp {
             ToggleSidebar,
             ToggleDashboard,
             OpenSettings,
-            ReadAloud,
         ];
-        // Start over / stop only mean something once there is a reading.
-        let has_reading = self.readings.current.is_some()
-            || self
-                .read_aloud_target()
-                .is_some_and(|iid| self.readings.state(iid) != ReadState::Idle);
-        if has_reading {
-            cmds.push(ReadAloudRestart);
-            cmds.push(ReadAloudStop);
-        }
         // Only meaningful with an active project to open the memory for.
         if self.workspace.active_project.is_some() {
             cmds.push(OpenMemory);
@@ -10848,16 +8808,6 @@ impl MuxelApp {
             PaletteCommand::ToggleDashboard => t("Toggle dashboard (all agents)").into(),
             PaletteCommand::OpenSettings => t("Open settings").into(),
             PaletteCommand::OpenMemory => t("Open project memory (.muxel/MEMORY.md)").into(),
-            PaletteCommand::ReadAloud => match self
-                .read_aloud_target()
-                .map_or(ReadState::Idle, |iid| self.readings.state(iid))
-            {
-                ReadState::Idle => t("Read the last reply aloud").into(),
-                ReadState::Playing => t("Pause reading aloud").into(),
-                ReadState::Paused => t("Resume reading aloud").into(),
-            },
-            PaletteCommand::ReadAloudRestart => t("Start reading aloud over").into(),
-            PaletteCommand::ReadAloudStop => t("Stop reading aloud").into(),
             PaletteCommand::RunRunner(i) => self
                 .runners
                 .get(i)
@@ -10894,12 +8844,6 @@ impl MuxelApp {
                     self.open_memory_panel(pid, window, cx);
                 }
             }
-            PaletteCommand::ReadAloud => self.toggle_read_aloud(cx),
-            PaletteCommand::ReadAloudRestart => match self.read_aloud_target() {
-                Some(iid) => self.restart_reading(iid, cx),
-                None => self.say_read_aloud_notice(t("Focus an agent pane first."), cx),
-            },
-            PaletteCommand::ReadAloudStop => self.stop_read_aloud_now(cx),
             PaletteCommand::RunRunner(i) => self.run_runner(i, String::new(), window, cx),
             PaletteCommand::SendSnippet(i) => self.send_snippet_to_active(i, window, cx),
         }
@@ -11100,7 +9044,7 @@ impl MuxelApp {
     }
 
     fn save_active_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((iid, ed)) = self.active_editor() else {
+        let Some((_iid, ed)) = self.active_editor() else {
             return;
         };
         if ed.read(cx).is_diff() {
@@ -11112,50 +9056,6 @@ impl MuxelApp {
                 let text = ed.read(cx).text(cx);
                 // Remote project: write over SSH (background); mark saved + toast
                 // only on success.
-                let pid = self.workspace.instance(iid).map(|i| i.project_id);
-                let remote_loc = pid.filter(|pid| {
-                    self.workspace
-                        .project(*pid)
-                        .is_some_and(|pr| pr.is_remote())
-                });
-                if let Some(loc) = remote_loc.and_then(|pid| self.repo_loc(pid)) {
-                    let abs = p.to_string_lossy().into_owned();
-                    let name = p
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    cx.spawn_in(window, async move |this, cx| {
-                        let res = cx
-                            .background_executor()
-                            .spawn(
-                                async move { integrations::write_remote_file(&loc, &abs, &text) },
-                            )
-                            .await;
-                        let _ = this.update(cx, |this, cx| {
-                            match res {
-                                Ok(()) => {
-                                    if let Some(ed) = this.editors.get(&iid).cloned() {
-                                        ed.update(cx, |e, cx| e.mark_saved(cx));
-                                    }
-                                    this.add_event(
-                                        NotifKind::Success,
-                                        tf("Saved {name}", &[("name", &name.to_string())]),
-                                        String::new(),
-                                    );
-                                }
-                                Err(e) => {
-                                    let msg = format!("{e}");
-                                    if !this.handle_ssh_error(&msg, None, SshRetry::None, cx) {
-                                        this.add_event(NotifKind::Error, t("Save failed"), msg);
-                                    }
-                                }
-                            }
-                            cx.notify();
-                        });
-                    })
-                    .detach();
-                    return;
-                }
                 if let Err(e) = std::fs::write(&p, text) {
                     log::warn!("save failed for {}: {e}", p.display());
                     return;
@@ -11373,7 +9273,7 @@ impl MuxelApp {
     /// fields (the project meta must still exist).
     fn teardown_closed_instance(
         &mut self,
-        iid: Uuid,
+        _iid: Uuid,
         project_id: Uuid,
         // The session name recorded on the instance, if it had one (`tmux_session`).
         recorded_session: Option<String>,
@@ -11381,49 +9281,8 @@ impl MuxelApp {
         worktree_id: Option<Uuid>,
         cx: &mut Context<Self>,
     ) {
-        let is_remote = self
-            .workspace
-            .project(project_id)
-            .is_some_and(|p| p.is_remote());
-        // Remote tmux session: closing a pane always tears its session down —
-        // a *dropped* SSH connection never reaches here (an abnormal exit leaves
-        // a tombstone pane instead of auto-closing), so reconnectability is
-        // preserved where it matters. Killed over ssh in the background
-        // (reuses the host's still-warm ControlMaster).
-        //
-        // Gated on the host having tmux *at all*, not on tmux being its current
-        // default: a host whose default was switched off since the pane launched
-        // still has that pane's session running, and skipping it here would both
-        // strand the agent and aim the local kill below at a remote session name.
-        let remote_host = self
-            .workspace
-            .project(project_id)
-            .and_then(|p| p.remote.clone())
-            .and_then(|r| {
-                self.remotes
-                    .iter()
-                    .find(|h| h.id == r.host_id)
-                    .map(|h| h.effective(&self.identities))
-            })
-            .filter(|host| !host.os.is_windows());
-        match remote_host {
-            // The same name the pane was launched with — a recomputed one would
-            // leave the session it was actually running alive on the host forever.
-            // A pane that never had a session confirms as already gone, so aiming
-            // at one costs a single round trip and nothing else.
-            Some(host) => {
-                let session =
-                    muxel_core::tmux::session_for(recorded_session.as_deref(), &host.name, iid);
-                self.reap_remote_session(project_id, iid, host, session, cx);
-            }
-            // A remote instance's session lives on the host, not here; killing the
-            // recorded name locally would be a no-op at best.
-            None if !is_remote => {
-                if let Some(session) = recorded_session {
-                    integrations::kill_tmux_session(&session);
-                }
-            }
-            None => {}
+        if let Some(session) = recorded_session {
+            integrations::kill_tmux_session(&session);
         }
         // Worktree disposed only when its last instance is gone.
         let root = self
@@ -11438,154 +9297,12 @@ impl MuxelApp {
         }
     }
 
-    /// Kill the tmux session a closed pane left on a remote host, and keep at it
-    /// until the host confirms the session is gone.
-    ///
-    /// One ssh round trip is not a guarantee: it can lose a race with the control
-    /// socket the pane's own ssh just took down, hit a blip, or reach a host that is
-    /// busy. Unconfirmed, that failure used to be invisible *and* self-reversing —
-    /// the agent kept running and the next connect adopted it back into a pane, so
-    /// closing a remote agent looked like it had worked until muxel restarted.
-    ///
-    /// So the close is written down first ([`Project::remember_closed_session`]),
-    /// retried a few times with a widening gap, and only forgotten once a kill comes
-    /// back confirmed. Anything the retries don't finish is finished at the next
-    /// connect by [`Self::reap_closed_sessions`], which has the host's real session
-    /// list to work from; until then the entry keeps the pane from being adopted
-    /// back.
-    fn reap_remote_session(
-        &mut self,
-        project_id: Uuid,
-        iid: Uuid,
-        host: RemoteHost,
-        session: String,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(p) = self.workspace.project_mut(project_id) {
-            p.remember_closed_session(session.clone(), iid);
-        }
-        let control_path = Self::control_path_for(host.id);
-        let password = (host.auth == SshAuth::Password)
-            .then(|| self.remote_password(&host))
-            .flatten();
-        cx.spawn(async move |this, cx| {
-            // Immediately, then backing off — a control socket that went down with
-            // the pane, or a momentary network stall, is usually over in seconds.
-            let mut err = None;
-            for (attempt, wait) in RETRY_REMOTE_KILL_SECS.iter().enumerate() {
-                if attempt > 0 {
-                    cx.background_executor()
-                        .timer(Duration::from_secs(*wait))
-                        .await;
-                }
-                let (host, control_path, session, password) = (
-                    host.clone(),
-                    control_path.clone(),
-                    session.clone(),
-                    password.clone(),
-                );
-                let res = cx
-                    .background_executor()
-                    .spawn(async move {
-                        integrations::kill_remote_tmux(
-                            &host,
-                            &control_path,
-                            password.as_deref(),
-                            &session,
-                        )
-                    })
-                    .await;
-                match res {
-                    Ok(()) => {
-                        err = None;
-                        break;
-                    }
-                    Err(e) => err = Some(format!("{e}")),
-                }
-            }
-            let _ = this.update(cx, |this, cx| match err {
-                None => this.finish_closed_session(project_id, iid),
-                Some(msg) => {
-                    // Not an error dialog: the session is remembered, the pane stays
-                    // closed, and the next connect to the host finishes the job.
-                    muxel_store::append_event_log(&format!(
-                        "close: “{session}” not confirmed dead on “{}” — {msg}",
-                        host.name
-                    ));
-                    this.dev_log.push(DevLogEntry {
-                        time: chrono::Local::now().format("%H:%M:%S").to_string(),
-                        kind: NotifKind::Error,
-                        title: t("Remote session").to_string(),
-                        detail: format!("{session}: {msg}"),
-                    });
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
-    }
-
-    /// A confirmed kill: drop the ledger entry so the session can be adopted again
-    /// if the host ever hands out that name once more.
-    fn finish_closed_session(&mut self, project_id: Uuid, iid: Uuid) {
-        if let Some(p) = self.workspace.project_mut(project_id)
-            && p.forget_closed_session(iid)
-        {
-            self.persist();
-        }
-    }
-
-    /// Connect-time half of [`Self::reap_remote_session`]: reconcile a project's
-    /// remembered closes against what is actually running on its host.
-    ///
-    /// The host's session list is the authority muxel lacked at close time. A close
-    /// with nothing left running is finished, whatever became of its kill. One with a
-    /// session still there gets another kill — aimed at the name the session actually
-    /// has, which a derived name may no longer match (a renamed host, a session a
-    /// peer created under its own slug).
-    ///
-    /// Runs before adoption, so a close that finished here doesn't keep a pane away.
-    fn reap_closed_sessions(
-        &mut self,
-        pid: Uuid,
-        sessions: &[muxel_core::tmux::RemoteSession],
-        cx: &mut Context<Self>,
-    ) {
-        let Some(project) = self.workspace.project(pid) else {
-            return;
-        };
-        if project.closed_sessions.is_empty() {
-            return;
-        }
-        let pending: Vec<(Uuid, Option<String>)> = project
-            .closed_sessions
-            .iter()
-            .map(|c| {
-                (
-                    c.instance,
-                    muxel_core::tmux::live_closed_session(sessions, c).map(|s| s.name.clone()),
-                )
-            })
-            .collect();
-        let Some(host) = self.remote_host_for_project(pid) else {
-            return;
-        };
-        for (iid, live) in pending {
-            match live {
-                Some(session) => self.reap_remote_session(pid, iid, host.clone(), session, cx),
-                None => self.finish_closed_session(pid, iid),
-            }
-        }
-    }
-
-    /// Manually close an instance (kills its tmux session, local or remote).
     fn close_instance(&mut self, iid: Uuid, cx: &mut Context<Self>) {
         self.close_instance_inner(iid, "close", cx);
     }
 
     /// Close an instance: drop its pane, kill the process, and tear down its tmux
-    /// session — local, or remote via [`Self::reap_remote_session`]. `reason` is the
-    /// word that lands in the event log.
+    /// session. `reason` is the word that lands in the event log.
     ///
     /// Reached only by a deliberate close and by auto-close on a *clean* exit; a
     /// dropped remote connection exits abnormally and tombstones the pane instead,
@@ -11693,7 +9410,7 @@ impl MuxelApp {
             return;
         }
         let base_label =
-            integrations::repo_current_branch(&integrations::RepoLoc::Local(root.clone()))
+            integrations::repo_current_branch(&integrations::RepoLoc::new(root.clone()))
                 .unwrap_or_else(|| "base".to_string());
         self.pending_worktree_dispose.push_back(WorktreeDispose {
             wid,
@@ -11741,7 +9458,7 @@ impl MuxelApp {
             return;
         }
         let base_label =
-            integrations::repo_current_branch(&integrations::RepoLoc::Local(root.clone()))
+            integrations::repo_current_branch(&integrations::RepoLoc::new(root.clone()))
                 .unwrap_or_else(|| "base".to_string());
         self.pending_worktree_dispose.push_back(WorktreeDispose {
             wid,
@@ -11774,7 +9491,7 @@ impl MuxelApp {
         } else {
             typed
         };
-        match integrations::git_commit(&integrations::RepoLoc::Local(d.path.clone()), &msg) {
+        match integrations::git_commit(&integrations::RepoLoc::new(d.path.clone()), &msg) {
             Ok(_) => {
                 integrations::remove_worktree(&d.root, &d.path);
                 self.workspace.remove_worktree_meta(d.wid);
@@ -11825,7 +9542,7 @@ impl MuxelApp {
                 typed
             };
             if let Err(e) =
-                integrations::git_commit(&integrations::RepoLoc::Local(d.path.clone()), &msg)
+                integrations::git_commit(&integrations::RepoLoc::new(d.path.clone()), &msg)
             {
                 log::warn!("worktree commit failed, keeping it: {e}");
                 if let Some(w) = self.workspace.worktree_mut(d.wid) {
@@ -11891,9 +9608,7 @@ impl MuxelApp {
                         let msg = format!("{e}");
                         // A remote git op refused by a changed host key gets the
                         // trust dialog instead of a raw OpenSSH error event.
-                        if !this.handle_ssh_error(&msg, None, SshRetry::None, cx) {
-                            this.add_event(NotifKind::Error, err_title, msg);
-                        }
+                        this.add_event(NotifKind::Error, err_title, msg);
                     }
                 }
                 cx.notify();
@@ -11953,41 +9668,10 @@ impl MuxelApp {
         );
     }
 
-    /// Run a git op on a project's repo (background + toast).
-    /// The git location for a project: remote (over its host's SSH, reusing the
-    /// ControlMaster) when the project is remote, else local.
+    /// The git location for a project's repo (local).
     fn repo_loc(&self, pid: Uuid) -> Option<integrations::RepoLoc> {
         let p = self.workspace.project(pid)?;
-        match &p.remote {
-            Some(r) => {
-                let host = self
-                    .remotes
-                    .iter()
-                    .find(|h| h.id == r.host_id)?
-                    .effective(&self.identities);
-                let password = (host.auth == SshAuth::Password)
-                    .then(|| self.remote_password(&host))
-                    .flatten();
-                Some(integrations::RepoLoc::remote(
-                    host,
-                    r.remote_root.clone(),
-                    Self::control_path_for(r.host_id),
-                    password,
-                ))
-            }
-            None => Some(integrations::RepoLoc::Local(p.root_path.clone())),
-        }
-    }
-
-    /// Whether a project's pane layout should be synced to a `.muxel/workspace.json`
-    /// that an SSH peer (the iOS app) can read and attach to: always for a remote
-    /// project, and for a local project when tmux mode is on (so its panes are tmux
-    /// sessions a peer can attach to over SSH). Without tmux a local project has no
-    /// attachable sessions, so there's nothing to share.
-    fn project_syncs_layout(&self, pid: Uuid) -> bool {
-        self.workspace
-            .project(pid)
-            .is_some_and(|p| p.remote.is_some() || self.use_tmux)
+        Some(integrations::RepoLoc::new(p.root_path.clone()))
     }
 
     /// Toggle the project-memory panel for `pid` (hides if already shown for that
@@ -12150,17 +9834,13 @@ impl MuxelApp {
         let Some(p) = self.workspace.project(pid) else {
             return;
         };
-        let is_remote = p.remote.is_some();
-        let root = match &p.remote {
-            Some(r) => r.remote_root.clone(),
-            None => p.root_path.display().to_string(),
-        };
-        let path = PathBuf::from(format!("{root}/{MEMORY_DIR}/{MEMORY_FILE}"));
+        let path = PathBuf::from(format!(
+            "{}/{MEMORY_DIR}/{MEMORY_FILE}",
+            p.root_path.display()
+        ));
         let target = self.active_instance;
         // Seed the file if it doesn't exist yet (e.g. memory injection never on).
-        if is_remote {
-            self.ensure_project_memory(pid, cx);
-        } else if let Some(loc) = self.repo_loc(pid)
+        if let Some(loc) = self.repo_loc(pid)
             && let Err(e) = integrations::ensure_memory_file(&loc)
         {
             self.add_event(NotifKind::Error, t("Project memory"), format!("{e}"));
@@ -12182,351 +9862,12 @@ impl MuxelApp {
             if let Err(e) = res {
                 let _ = this.update(cx, |this, cx| {
                     let msg = format!("{e}");
-                    if !this.handle_ssh_error(&msg, None, SshRetry::None, cx) {
-                        this.add_event(NotifKind::Error, t("Project memory"), msg);
-                    }
+                    this.add_event(NotifKind::Error, t("Project memory"), msg);
                     cx.notify();
                 });
             }
         })
         .detach();
-    }
-
-    /// Remote-layout sync heartbeat, driven from `tick()`. For every remote project
-    /// already reconciled this session, detect a real layout change (by content,
-    /// ignoring timestamps), stamp a new version if it is an edit, and schedule a
-    /// debounced push; then fire any push whose debounce window has elapsed.
-    fn tick_remote_sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.remote_synced.is_empty() {
-            return;
-        }
-        let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
-        let now = Instant::now();
-        let synced: Vec<Uuid> = self.remote_synced.iter().copied().collect();
-        let mut changed = false;
-        for pid in synced {
-            if !self.project_syncs_layout(pid) {
-                continue;
-            }
-            let Some(proj) = self.workspace.project(pid) else {
-                continue;
-            };
-            let doc = RemoteLayout::capture(proj, &self.workspace, now_epoch);
-            let key = doc.content_key();
-            if self.layout_keys.get(&pid) != Some(&key) {
-                self.layout_keys.insert(pid, key);
-                // An edit gets a new revision. Session bookkeeping this machine filled
-                // in by itself (a tmux binding, a conversation id) keeps the one it
-                // had: pushed so peers learn it, it must not outrank a peer's edit
-                // made meanwhile (see `RemoteLayout::edit_key`).
-                let edit = doc.edit_key();
-                if self.layout_edit_keys.get(&pid) != Some(&edit) {
-                    self.layout_edit_keys.insert(pid, edit);
-                    if let Some(p) = self.workspace.project_mut(pid) {
-                        p.layout_updated_at = Some(now_epoch);
-                    }
-                }
-                // Debounce: each fresh change pushes the deadline ~2s out.
-                self.remote_push_due
-                    .insert(pid, now + Duration::from_secs(2));
-                changed = true;
-            }
-        }
-        if changed {
-            self.persist();
-        }
-        let due: Vec<Uuid> = self
-            .remote_push_due
-            .iter()
-            .filter(|(_, t)| **t <= now)
-            .map(|(pid, _)| *pid)
-            .collect();
-        for pid in due {
-            self.remote_push_due.remove(&pid);
-            self.push_remote_layout_now(pid, window, cx);
-        }
-    }
-
-    /// Push a layout-synced project's current pane layout to
-    /// `<root>/.muxel/workspace.json` off the UI thread (backs up the previous copy
-    /// first) — over SSH for a remote project, on the local filesystem for a local one.
-    ///
-    /// The file is re-read just before the write. If a peer has written something
-    /// this machine hasn't seen, and under the live-poll rule it wins, the peer's
-    /// layout is adopted instead and this machine pushes again on top of it: writing
-    /// over it would silently undo the peer's change — a pane it had just moved
-    /// snapping back to where it was created.
-    fn push_remote_layout_now(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        enum Pushed {
-            Written,
-            /// The file holds a peer's newer layout (its JSON), left in place.
-            PeerAhead(String),
-        }
-        if !self.project_syncs_layout(pid) {
-            return;
-        }
-        // One push per project at a time: go again once the one in flight lands.
-        if self.remote_push_inflight.contains(&pid) {
-            self.remote_push_due
-                .insert(pid, Instant::now() + Duration::from_secs(1));
-            return;
-        }
-        let Some(loc) = self.repo_loc(pid) else {
-            return;
-        };
-        let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
-        let Some(proj) = self.workspace.project(pid) else {
-            return;
-        };
-        let name = proj.name.clone();
-        let local_rev = proj.layout_updated_at.unwrap_or(0);
-        let doc = RemoteLayout::capture(proj, &self.workspace, now_epoch);
-        let key = doc.content_key();
-        let synced = self.layout_synced_keys.get(&pid).cloned();
-        // The file already holds this layout, as far as this machine knows.
-        if synced.as_deref() == Some(key.as_str()) {
-            return;
-        }
-        let root = doc.remote_root.clone();
-        let json = doc.to_json();
-        let local_key = key.clone();
-        self.remote_push_inflight.insert(pid);
-        cx.spawn_in(window, async move |this, cx| {
-            let res = cx
-                .background_executor()
-                .spawn(async move {
-                    if let Some(current) = integrations::fetch_remote_layout(&loc)
-                        && let Some(file) = RemoteLayout::parse(&current, &root)
-                        && muxel_core::push_overwrites_peer(
-                            &file,
-                            synced.as_deref(),
-                            &local_key,
-                            local_rev,
-                        )
-                    {
-                        return Ok(Pushed::PeerAhead(current));
-                    }
-                    integrations::push_remote_layout(&loc, &json).map(|()| Pushed::Written)
-                })
-                .await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.remote_push_inflight.remove(&pid);
-                match res {
-                    Ok(Pushed::Written) => {
-                        this.layout_synced_keys.insert(pid, key);
-                        this.layout_push_failing.remove(&pid);
-                    }
-                    Ok(Pushed::PeerAhead(current)) => {
-                        this.poll_peer_layout(pid, &current, window, cx);
-                        // What this machine still has to add goes out next, on top of
-                        // the peer's layout rather than instead of it.
-                        this.remote_push_due
-                            .entry(pid)
-                            .or_insert_with(|| Instant::now() + Duration::from_secs(1));
-                    }
-                    Err(e) => {
-                        // Retry quietly: a peer must eventually see this layout even
-                        // if nothing else changes here.
-                        this.remote_push_due
-                            .entry(pid)
-                            .or_insert_with(|| Instant::now() + Duration::from_secs(30));
-                        let msg = format!("{e}");
-                        // Report a failing host once per streak — each retry, and every
-                        // later layout change, would otherwise raise it again.
-                        if !this.handle_ssh_error(&msg, None, SshRetry::None, cx)
-                            && this.layout_push_failing.insert(pid)
-                        {
-                            this.add_event(
-                                NotifKind::Error,
-                                t("Layout sync"),
-                                format!("{name}: {msg}"),
-                            );
-                            cx.notify();
-                        }
-                    }
-                }
-            });
-        })
-        .detach();
-    }
-
-    /// Decide the connect-time sync direction for a remote project and apply it:
-    /// pull a strictly-newer remote layout (backing up the local copy), or schedule
-    /// a push when the local copy is newer / the remote has none, or do nothing when
-    /// they already match. Marks the project reconciled for this session.
-    fn apply_remote_layout_sync(
-        &mut self,
-        pid: Uuid,
-        fetched: Option<String>,
-        // Whether the host actually has a `.muxel/MEMORY.md` — the fallback for a
-        // doc written before `memory_enabled` was part of it.
-        has_memory: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.remote_synced.insert(pid);
-        let now_epoch = chrono::Local::now().timestamp().max(0) as u64;
-        let Some(proj) = self.workspace.project(pid) else {
-            return;
-        };
-        // Identity root for validating the stored doc: the remote path, or the local
-        // root path for a local (tmux) project synced for an SSH peer.
-        let layout_root = match &proj.remote {
-            Some(r) => r.remote_root.clone(),
-            None => proj.root_path.display().to_string(),
-        };
-        let local = RemoteLayout::capture(proj, &self.workspace, now_epoch);
-        let local_key = local.content_key();
-        let local_edit = local.edit_key();
-        let local_rev = proj.layout_updated_at.unwrap_or(0);
-        let remote = fetched
-            .as_deref()
-            .and_then(|j| RemoteLayout::parse(j, &layout_root));
-
-        // Whether the stored doc says anything about shared memory. A doc from before
-        // the field existed says nothing — see below.
-        let recorded_memory = remote.as_ref().and_then(|r| r.memory_enabled);
-
-        match remote {
-            // Remote is strictly newer and actually different → adopt it.
-            Some(r) if r.updated_at > local_rev && r.content_key() != local_key => {
-                self.pull_remote_layout(pid, local, r, window, cx);
-            }
-            // Already in sync → just arm change detection.
-            Some(r) if r.content_key() == local_key => {
-                self.layout_keys.insert(pid, local_key.clone());
-                self.layout_edit_keys.insert(pid, local_edit);
-                self.layout_synced_keys.insert(pid, local_key);
-            }
-            // Local is newer, or there's no usable remote doc → push local up.
-            _ => {
-                self.layout_keys.insert(pid, local_key);
-                self.layout_edit_keys.insert(pid, local_edit);
-                self.remote_push_due.insert(pid, Instant::now());
-            }
-        }
-
-        // Shared memory belongs to the project, not to one machine: the file lives at
-        // the root and every agent working there shares it. When the doc records the
-        // flag, the pull above has already applied it. When it doesn't — a doc written
-        // before the flag existed — fall back to the plain evidence: a project whose
-        // root *has* a memory file is one whose memory is in use, and showing the
-        // toggle off there is simply wrong. Recording it now gives every peer the
-        // opinion the doc was missing.
-        if recorded_memory.is_none()
-            && has_memory
-            && let Some(project) = self.workspace.project_mut(pid)
-            && !project.memory_enabled
-        {
-            project.memory_enabled = true;
-            self.persist();
-            self.remote_push_due.insert(pid, Instant::now());
-        }
-    }
-
-    /// Adopt a newer remote layout: back up the local copy, tear down the project's
-    /// current local views (the remote tmux sessions / worktrees survive and are
-    /// re-attached on respawn), then swap in the remote layout/instances/worktrees
-    /// remapped to this project. The caller respawns terminals afterwards.
-    fn pull_remote_layout(
-        &mut self,
-        pid: Uuid,
-        local: RemoteLayout,
-        remote: RemoteLayout,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.backup_local_layout(pid, &local, remote.updated_at);
-        let remote_key = remote.content_key();
-
-        // Light teardown: drop the local views (kill the ssh client / local PTY),
-        // but don't mutate the layout or dispose worktrees — we replace wholesale.
-        for iid in self
-            .workspace
-            .project(pid)
-            .map(|p| p.instances())
-            .unwrap_or_default()
-        {
-            if let Some(view) = self.terminals.remove(&iid) {
-                view.read(cx).session().kill();
-            }
-            self.editors.remove(&iid);
-            self.browsers.remove(&iid);
-            self.last_status.remove(&iid);
-            self.workspace.remove_instance_meta(iid);
-        }
-
-        let RemoteLayout {
-            layout,
-            instances,
-            mut worktrees,
-            updated_at,
-            memory_enabled,
-            ..
-        } = remote;
-        // Shared memory is the host's state, not this machine's: the memory file
-        // lives there and every agent on it shares the one file. A doc written
-        // before the field existed has no opinion, and leaves the local flag alone.
-        if let Some(enabled) = memory_enabled
-            && let Some(project) = self.workspace.project_mut(pid)
-        {
-            project.memory_enabled = enabled;
-        }
-        // What this machine observed of each pane (program title, grid, activity) is
-        // its own; a structural pull must not replace it with the peer's.
-        let mut instances = muxel_core::merge_peer_instances(&local.instances, instances, pid);
-        self.bind_peer_sessions(pid, &mut instances);
-        for wt in &mut worktrees {
-            wt.project_id = pid;
-        }
-        // Replace worktrees by id (a re-pull refreshes them), then add instances.
-        for wt in worktrees {
-            self.workspace.remove_worktree_meta(wt.id);
-            self.workspace.add_worktree(wt);
-        }
-        for inst in instances {
-            self.workspace.add_instance(inst);
-        }
-        if let Some(p) = self.workspace.project_mut(pid) {
-            p.layout = layout;
-            p.layout_updated_at = Some(updated_at);
-        }
-        self.seed_adopted_layout(pid, remote_key);
-        self.active_instance = self
-            .workspace
-            .project(pid)
-            .and_then(|p| p.preferred_instance());
-        self.persist();
-        self.add_event(
-            NotifKind::Success,
-            t("Layout restored from remote").to_string(),
-            String::new(),
-        );
-    }
-
-    /// Save the local layout being replaced to `<workspace>/backups/<pid>-<ts>.json`
-    /// so a newer-remote pull can't silently lose work. This is the safety net
-    /// that pull relies on, so a failed backup is reported, not swallowed.
-    fn backup_local_layout(&mut self, pid: Uuid, local: &RemoteLayout, ts: u64) {
-        let Some(workspace) = self.current_workspace else {
-            return;
-        };
-        let Some(dir) = muxel_store::workspace_doc_path(workspace)
-            .and_then(|p| p.parent().map(|d| d.join("backups")))
-        else {
-            return;
-        };
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            self.report_save_error(SaveTarget::LayoutBackup, format!("{}: {e}", dir.display()));
-            return;
-        }
-        let path = dir.join(format!("{}-{}.json", pid.simple(), ts));
-        match std::fs::write(&path, local.to_json()) {
-            Ok(()) => self.clear_save_error(SaveTarget::LayoutBackup),
-            Err(e) => {
-                self.report_save_error(SaveTarget::LayoutBackup, format!("{}: {e}", path.display()))
-            }
-        }
     }
 
     fn run_project_git<F>(
@@ -12742,234 +10083,6 @@ impl MuxelApp {
         cx.notify();
     }
 
-    /// The project git modal (commit message / new branch name).
-    /// The new-remote-project wizard modal: pick a host, enter the remote
-    /// directory + a name, optionally verify, then create.
-    fn render_remote_project_modal(&self, cx: &mut Context<Self>) -> AnyElement {
-        let card = div()
-            .w(px(460.0))
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p_5()
-            .bg(cx.theme().background)
-            .border_1()
-            .border_color(cx.theme().border)
-            .rounded(cx.theme().radius_lg)
-            .shadow_lg()
-            .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
-            .child(
-                div()
-                    .text_lg()
-                    .font_semibold()
-                    .child(t("New remote project")),
-            );
-
-        let card = if self.remotes.is_empty() {
-            card.child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t("No SSH hosts yet — add one, then come back.")),
-            )
-            .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap_2()
-                    .pt_2()
-                    .child(
-                        Button::new("nr-cancel")
-                            .ghost()
-                            .label(t("Cancel"))
-                            .on_click(
-                                cx.listener(|this, _e, _w, cx| this.close_remote_project_modal(cx)),
-                            ),
-                    )
-                    .child(
-                        Button::new("nr-add-host")
-                            .primary()
-                            .icon(IconName::Plus)
-                            .label(t("Add host"))
-                            .on_click(cx.listener(|this, _e, window, cx| {
-                                this.open_add_remote_host(window, cx)
-                            })),
-                    ),
-            )
-        } else {
-            let mut hosts = div().flex().flex_wrap().gap_1();
-            for h in &self.remotes {
-                let id = h.id;
-                let label = if h.name.is_empty() {
-                    h.hostname.clone()
-                } else {
-                    h.name.clone()
-                };
-                hosts = hosts.child(
-                    Button::new(SharedString::from(format!("nr-host-{}", id.simple())))
-                        .ghost()
-                        .selected(self.nr_host == Some(id))
-                        .icon(IconName::Network)
-                        .label(label)
-                        .on_click(cx.listener(move |this, _e, _w, cx| {
-                            this.nr_host = Some(id);
-                            cx.notify();
-                        })),
-                );
-            }
-            hosts = hosts.child(
-                Button::new("nr-add-host")
-                    .ghost()
-                    .icon(IconName::Plus)
-                    .label(t("Add host"))
-                    .on_click(
-                        cx.listener(|this, _e, window, cx| this.open_add_remote_host(window, cx)),
-                    ),
-            );
-            card.child(self.settings_label(&t("Host"), cx))
-                .child(hosts)
-                .child(
-                    div().pt_1().child(
-                        Button::new("nr-scan")
-                            .ghost()
-                            .icon(IconName::Search)
-                            .label(t("Scan for projects"))
-                            .on_click(cx.listener(|this, _e, window, cx| {
-                                this.scan_remote_dirs(window, cx)
-                            })),
-                    ),
-                )
-                // Inline scan status / found-project rows (click one to fill the inputs).
-                .children(match &self.nr_scan {
-                    RemoteScanState::Idle => None,
-                    RemoteScanState::Scanning => Some(
-                        div()
-                            .pt_1()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(t("Scanning…"))
-                            .into_any_element(),
-                    ),
-                    RemoteScanState::Failed(msg) => Some(
-                        div()
-                            .pt_1()
-                            .min_w_0()
-                            .text_xs()
-                            .text_color(cx.theme().danger)
-                            .child(format!("✗ {msg}"))
-                            .into_any_element(),
-                    ),
-                    RemoteScanState::Found(roots) if roots.is_empty() => Some(
-                        div()
-                            .pt_1()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(t("No muxel projects found on this host."))
-                            .into_any_element(),
-                    ),
-                    RemoteScanState::Found(roots) => {
-                        let mut list = div()
-                            .id("nr-found-list")
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .pt_1()
-                            .max_h(px(180.))
-                            .overflow_y_scroll();
-                        for r in roots {
-                            let root = r.clone();
-                            list = list.child(
-                                Button::new(SharedString::from(format!("nr-found-{root}")))
-                                    .ghost()
-                                    .icon(IconName::Folder)
-                                    .label(root.clone())
-                                    .on_click(cx.listener(move |this, _e, window, cx| {
-                                        this.pick_scanned_root(&root, window, cx)
-                                    })),
-                            );
-                        }
-                        Some(list.into_any_element())
-                    }
-                })
-                .child(self.settings_label(&t("Remote directory"), cx))
-                .child(Input::new(&self.nr_dir))
-                .child(self.settings_label(&t("Project name (optional)"), cx))
-                .child(Input::new(&self.nr_name))
-                // Inline Verify result, above the buttons.
-                .children(match &self.nr_verify {
-                    RemoteTestState::Idle => None,
-                    RemoteTestState::Testing => Some(
-                        div()
-                            .pt_1()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(t("Verifying…"))
-                            .into_any_element(),
-                    ),
-                    RemoteTestState::Ok(msg) => Some(
-                        div()
-                            .pt_1()
-                            .text_xs()
-                            .text_color(cx.theme().success)
-                            .child(format!("✓ {msg}"))
-                            .into_any_element(),
-                    ),
-                    RemoteTestState::Failed(msg) => Some(
-                        div()
-                            .pt_1()
-                            .min_w_0()
-                            .text_xs()
-                            .text_color(cx.theme().danger)
-                            .child(format!("✗ {msg}"))
-                            .into_any_element(),
-                    ),
-                })
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .pt_2()
-                        .child(
-                            Button::new("nr-verify")
-                                .ghost()
-                                .label(t("Verify"))
-                                .on_click(cx.listener(|this, _e, window, cx| {
-                                    this.verify_remote_dir(window, cx)
-                                })),
-                        )
-                        .child(div().flex_1())
-                        .child(
-                            Button::new("nr-cancel")
-                                .ghost()
-                                .label(t("Cancel"))
-                                .on_click(cx.listener(|this, _e, _w, cx| {
-                                    this.close_remote_project_modal(cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("nr-create")
-                                .primary()
-                                .label(t("Create"))
-                                .on_click(cx.listener(|this, _e, window, cx| {
-                                    this.confirm_remote_project(window, cx)
-                                })),
-                        ),
-                )
-        };
-
-        modal_backdrop()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _ev, _w, cx| this.close_remote_project_modal(cx)),
-            )
-            .child(card)
-            .into_any_element()
-    }
-
-    /// The docked project-memory panel (second sidebar, like the file browser):
-    /// header, search, the maintained (ordered) entry list with pin / delete, and an
-    /// add form pinned at the bottom.
     fn render_memory_panel(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(pid) = self.memory_pid else {
             return div().into_any_element();
@@ -13202,77 +10315,6 @@ impl MuxelApp {
             )
             .child(list)
             .child(add_form)
-            .into_any_element()
-    }
-
-    /// The SSH password prompt (for a host with no saved password).
-    fn render_password_prompt(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(p) = &self.password_prompt else {
-            return div().into_any_element();
-        };
-        let host_name = self
-            .remotes
-            .iter()
-            .find(|h| h.id == p.host_id)
-            .map(|h| h.name.clone())
-            .unwrap_or_default();
-        let (confirm, hint) = match p.action {
-            PasswordAction::Connect(_) => (
-                t("Connect"),
-                t("Kept in memory for this session only — not saved to the keychain."),
-            ),
-            PasswordAction::Verify(_) => (t("Test"), t("Used once to test, then forgotten.")),
-        };
-        modal_backdrop()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _ev, window, cx| this.close_password_prompt(window, cx)),
-            )
-            .child(
-                div()
-                    .w(px(420.0))
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .p_5()
-                    .bg(cx.theme().background)
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .rounded(cx.theme().radius_lg)
-                    .shadow_lg()
-                    .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
-                    .child(div().text_lg().font_semibold().child(tf(
-                        "SSH password for “{host_name}”",
-                        &[("host_name", &host_name.to_string())],
-                    )))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(hint),
-                    )
-                    .child(Input::new(&self.password_prompt_input))
-                    .child(
-                        div()
-                            .flex()
-                            .justify_end()
-                            .gap_2()
-                            .pt_2()
-                            .child(
-                                Button::new("pw-cancel")
-                                    .ghost()
-                                    .label(t("Cancel"))
-                                    .on_click(cx.listener(|this, _e, window, cx| {
-                                        this.close_password_prompt(window, cx)
-                                    })),
-                            )
-                            .child(Button::new("pw-confirm").primary().label(confirm).on_click(
-                                cx.listener(|this, _e, window, cx| {
-                                    this.confirm_password_prompt(window, cx)
-                                }),
-                            )),
-                    ),
-            )
             .into_any_element()
     }
 
@@ -13921,32 +10963,6 @@ impl MuxelApp {
                 this.activate_main_window(window, cx);
                 this.toggle_broadcast(window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ToggleSpeechToText, window, cx| {
-                this.activate_main_window(window, cx);
-                this.toggle_speech(window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &HoldSpeechToText, window, cx| {
-                this.activate_main_window(window, cx);
-                this.start_hold(cx)
-            }))
-            .on_action(cx.listener(|this, _: &ReadAloud, _window, cx| this.toggle_read_aloud(cx)))
-            .on_action(cx.listener(|this, _: &ReadAloudRestart, _window, cx| {
-                match this.read_aloud_target() {
-                    Some(iid) => this.restart_reading(iid, cx),
-                    None => this.say_read_aloud_notice(t("Focus an agent pane first."), cx),
-                }
-            }))
-            .on_action(
-                cx.listener(|this, _: &ReadAloudStop, _window, cx| this.stop_read_aloud_now(cx)),
-            )
-            // Push-to-hold: releasing any key while a hold dictation is active
-            // stops recording and transcribes. Key-ups bubble up the focus tree
-            // to this root, so this fires even while a terminal pane is focused.
-            .on_key_up(cx.listener(|this, _ev: &KeyUpEvent, window, cx| {
-                if this.stt_hold {
-                    this.stop_hold(window, cx);
-                }
-            }))
             .on_action(
                 cx.listener(|this, _: &ToggleWorktree, _window, cx| this.toggle_worktree(cx)),
             )
@@ -14013,14 +11029,7 @@ impl MuxelApp {
                 .and_then(|l| l.leaf_containing(max))
                 .cloned()
         });
-        let failed_remote = self
-            .remote_connect_failed
-            .get(&pid)
-            .filter(|_| !self.project_has_live_panes(pid))
-            .cloned();
-        let main_content: AnyElement = if let Some(msg) = failed_remote {
-            self.render_remote_connect_failed(pid, &msg, cx)
-        } else if let Some(leaf) = maximized_here {
+        let main_content: AnyElement = if let Some(leaf) = maximized_here {
             self.render_pane(&leaf, cx)
         } else {
             match layout {
@@ -14574,8 +11583,6 @@ impl MuxelApp {
             ConfirmAction::DeleteRunner(idx) => self.delete_runner(idx, cx),
             ConfirmAction::DeleteSnippet(idx) => self.delete_snippet(idx, cx),
             ConfirmAction::DeleteLoop(idx) => self.delete_loop(idx, cx),
-            ConfirmAction::DeleteRemote(idx) => self.delete_remote(idx, cx),
-            ConfirmAction::DeleteIdentity(idx) => self.delete_identity(idx, cx),
             ConfirmAction::CloseInstance(iid) => {
                 self.close_instance(iid, cx);
                 if let Some(next) = self.active_instance {
@@ -14608,186 +11615,10 @@ impl MuxelApp {
                 self.refresh_git_diff_panel(cx);
             }
             ConfirmAction::DeleteWorktreeFromPanel { wid } => self.worktree_delete(wid, window, cx),
-            ConfirmAction::TrustHostKey { entry, file, retry } => {
-                self.trust_host_key(entry, file, retry, window, cx)
-            }
         }
         cx.notify();
     }
 
-    /// The changed-key dialog's accept path: remove the stale known_hosts entry
-    /// (`ssh-keygen -R` on the background executor) and retry the operation —
-    /// the reconnect re-pins the new key through ssh's `accept-new`.
-    fn trust_host_key(
-        &mut self,
-        entry: String,
-        file: Option<String>,
-        retry: SshRetry,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        cx.spawn_in(window, async move |this, cx| {
-            let res = {
-                let entry = entry.clone();
-                cx.background_executor()
-                    .spawn(async move { integrations::forget_host_key(&entry, file.as_deref()) })
-                    .await
-            };
-            let _ = this.update_in(cx, |this, window, cx| {
-                match res {
-                    Ok(()) => {
-                        let detail = match &retry {
-                            SshRetry::None => t("retry the operation to reconnect").into(),
-                            _ => String::new(),
-                        };
-                        this.add_event(
-                            NotifKind::Success,
-                            tf("Trusted the new key for {host}", &[("host", &entry)]),
-                            detail,
-                        );
-                        this.retry_after_trust(retry, window, cx);
-                    }
-                    Err(e) => {
-                        // e.g. a read-only system known_hosts — surface
-                        // ssh-keygen's own message.
-                        this.add_event(
-                            NotifKind::Error,
-                            t("Couldn't update known_hosts"),
-                            format!("{e:#}"),
-                        );
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// Re-run the operation that hit the changed host key, now that its stale
-    /// entry is gone.
-    fn retry_after_trust(&mut self, retry: SshRetry, window: &mut Window, cx: &mut Context<Self>) {
-        match retry {
-            SshRetry::None => {}
-            SshRetry::ConnectProject(pid) => {
-                self.ensure_project_terminals_deferred(pid, window, cx)
-            }
-            SshRetry::VerifyHost { idx, password } => self.run_ssh_check(idx, password, window, cx),
-            SshRetry::VerifyRemoteDir => self.verify_remote_dir(window, cx),
-            SshRetry::ScanRemoteDirs => self.scan_remote_dirs(window, cx),
-        }
-    }
-
-    /// If `err` is OpenSSH's changed-host-key refusal, open the trust dialog
-    /// (fetching the stored fingerprint in the background first) and return
-    /// true — the caller skips its raw error handling. `fallback_host` supplies
-    /// the known_hosts token when ssh's output didn't name the host.
-    fn handle_ssh_error(
-        &mut self,
-        err: &str,
-        fallback_host: Option<&RemoteHost>,
-        retry: SshRetry,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(change) = ssh::HostKeyChange::parse(err) else {
-            return false;
-        };
-        let entry = match change
-            .host
-            .clone()
-            .or_else(|| fallback_host.map(|h| ssh::known_hosts_name(&h.hostname, h.port)))
-        {
-            Some(e) => e,
-            None => return false,
-        };
-        // Concurrent failures for one host (pre-flight + a git poll) race here —
-        // keep the dialog already on screen instead of replacing it.
-        if matches!(
-            self.confirm,
-            Some(PendingConfirm {
-                action: ConfirmAction::TrustHostKey { .. },
-                ..
-            })
-        ) {
-            return true;
-        }
-        let file = change.known_hosts_file.clone();
-        cx.spawn(async move |this, cx| {
-            // The old fingerprint isn't in ssh's error output (only file:line) —
-            // look it up so the dialog can show stored vs presented like iOS.
-            let stored = {
-                let entry = entry.clone();
-                let file = file.clone();
-                cx.background_executor()
-                    .spawn(async move {
-                        integrations::stored_host_key_fingerprints(&entry, file.as_deref())
-                    })
-                    .await
-            };
-            let _ = this.update(cx, |this, cx| {
-                let mut details: Vec<(SharedString, SharedString)> = Vec::new();
-                let stored_line = {
-                    // Prefer the key type ssh called "offending"; else show all.
-                    let matching: Vec<_> = match &change.offending_key_type {
-                        Some(t) => {
-                            let filtered: Vec<_> = stored
-                                .iter()
-                                .filter(|(ty, _)| ty.eq_ignore_ascii_case(t))
-                                .cloned()
-                                .collect();
-                            if filtered.is_empty() {
-                                stored.clone()
-                            } else {
-                                filtered
-                            }
-                        }
-                        None => stored.clone(),
-                    };
-                    if matching.is_empty() {
-                        t("(not found)").to_string()
-                    } else {
-                        matching
-                            .iter()
-                            .map(|(ty, fp)| format!("{ty} {fp}"))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    }
-                };
-                details.push((t("Stored"), stored_line.into()));
-                let presented = match (&change.presented_key_type, &change.presented_fingerprint) {
-                    (Some(ty), Some(fp)) => format!("{ty} {fp}"),
-                    (None, Some(fp)) => fp.clone(),
-                    _ => t("(unknown)").to_string(),
-                };
-                details.push((t("Presented now"), presented.into()));
-                if let (Some(f), Some(l)) = (&change.known_hosts_file, change.known_hosts_line) {
-                    details.push((t("known_hosts"), format!("{f}:{l}").into()));
-                }
-                this.request_confirm_with_details(
-                    t("Host key changed"),
-                    tf(
-                        "“{host}” presented a different host key than the one stored in \
-                         known_hosts. This can mean the server was reinstalled — or that \
-                         something is intercepting the connection (man-in-the-middle). \
-                         Only trust the new key if you know why it changed.",
-                        &[("host", &entry)],
-                    ),
-                    t("Trust new key"),
-                    details,
-                    ConfirmAction::TrustHostKey {
-                        entry: entry.clone(),
-                        file,
-                        retry,
-                    },
-                    cx,
-                );
-            });
-        })
-        .detach();
-        true
-    }
-
-    /// Delete a workspace: remove it from the index + delete its workspace file.
-    /// Never deletes the last remaining workspace.
     fn delete_workspace(&mut self, id: Uuid, cx: &mut Context<Self>) {
         if self.workspaces.workspaces.len() <= 1 {
             return;
@@ -14857,76 +11688,13 @@ impl MuxelApp {
         // (`teardown_closed_instance`): the host having tmux, not tmux being its
         // current default — a default switched off since the pane launched must not
         // leave the old session running for `new-session -A` to reattach.
-        let remote_host = self
-            .remote_host_for_instance(iid)
-            .filter(|host| !host.os.is_windows());
-        let Some(host) = remote_host else {
-            if let Some(session) = recorded_session {
-                integrations::kill_tmux_session(&session);
-            }
-            self.spawn_terminal(iid, window, cx);
-            self.focus_instance(iid, window, cx);
-            cx.notify();
-            return;
-        };
-        // The session lives on the host: respawn only once it is gone, or
-        // `new-session -A` would reattach the old agent.
-        let session = muxel_core::tmux::session_for(recorded_session.as_deref(), &host.name, iid);
-        let control_path = Self::control_path_for(host.id);
-        let password = (host.auth == SshAuth::Password)
-            .then(|| self.remote_password(&host))
-            .flatten();
-        let host_name = host.name.clone();
-        let label = session.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let killed = cx
-                .background_executor()
-                .spawn(async move {
-                    integrations::kill_remote_tmux(
-                        &host,
-                        &control_path,
-                        password.as_deref(),
-                        &session,
-                    )
-                })
-                .await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                if this.workspace.instance(iid).is_none() {
-                    return; // closed while the kill was in flight
-                }
-                // Say so rather than letting it pass as a restart: the respawn below
-                // is `new-session -A`, so a session that survived is *reattached* —
-                // the same agent, looking like a restart that did nothing.
-                if let Err(e) = killed {
-                    this.add_event(
-                        NotifKind::Error,
-                        tf(
-                            "Couldn't restart on “{host}”",
-                            &[("host", &host_name.to_string())],
-                        ),
-                        tf(
-                            "{session} is still running, so the pane reattached to it: {err}",
-                            &[("session", &label), ("err", &format!("{e}"))],
-                        ),
-                    );
-                }
-                // A project restore may have reattached the old session meanwhile.
-                if let Some(view) = this.terminals.remove(&iid) {
-                    view.read(cx).session().kill();
-                }
-                this.spawn_terminal(iid, window, cx);
-                if this.active_instance == Some(iid) {
-                    this.focus_instance(iid, window, cx);
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        if let Some(session) = recorded_session {
+            integrations::kill_tmux_session(&session);
+        }
+        self.spawn_terminal(iid, window, cx);
         self.focus_instance(iid, window, cx);
         cx.notify();
     }
-
-    /// Duplicate an instance's launch spec into a new pane split beside it.
     fn duplicate_instance(&mut self, iid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         let Some(mut inst) = self.workspace.instance(iid).cloned() else {
             return;
@@ -15292,609 +12060,6 @@ impl MuxelApp {
         if let Some(iid) = self.active_instance {
             self.send_snippet_to(iid, idx, window, cx);
         }
-    }
-
-    // --- Speech-to-text: dictate into the focused agent -----------------------
-
-    /// Whether there is a focused terminal/agent pane to dictate into.
-    fn has_dictation_target(&self) -> bool {
-        self.active_instance
-            .is_some_and(|iid| self.terminals.contains_key(&iid))
-    }
-
-    /// Mic button / `ToggleSpeechToText`: start recording, or stop + transcribe
-    /// if already recording. Ignored while a transcription is in flight.
-    fn toggle_speech(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.stt_state {
-            SttState::Recording => self.stop_and_transcribe(window, cx),
-            SttState::Busy(_) => {}
-            _ => self.start_recording(cx),
-        }
-    }
-
-    /// Push-to-hold key-down: begin a hold dictation if idle.
-    fn start_hold(&mut self, cx: &mut Context<Self>) {
-        if self.stt_state != SttState::Idle {
-            return; // ignore key-repeat / already recording
-        }
-        self.stt_hold = true;
-        self.start_recording(cx);
-        // If the device failed to open, don't leave the hold flag stuck.
-        if self.stt_state != SttState::Recording {
-            self.stt_hold = false;
-        }
-    }
-
-    /// Push-to-hold key-up: stop and transcribe.
-    fn stop_hold(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.stt_hold {
-            return;
-        }
-        self.stt_hold = false;
-        if self.stt_state == SttState::Recording {
-            self.stop_and_transcribe(window, cx);
-        }
-    }
-
-    /// Begin capturing the microphone (needs a focused pane + a usable device).
-    ///
-    /// With the wake command on, a dictation with no target is still worth
-    /// recording — the words may be the wake phrase, whose whole job is to bring
-    /// dead panes back, not to be typed into one.
-    fn start_recording(&mut self, cx: &mut Context<Self>) {
-        if !self.has_dictation_target() && !self.settings.stt_wake_command {
-            self.stt_state = SttState::Error {
-                message: t("Focus an agent pane first").to_string(),
-                mic: false,
-            };
-            cx.notify();
-            return;
-        }
-        match crate::stt::start_capture() {
-            Ok(rec) => {
-                self.stt_recording = Some(rec);
-                self.stt_state = SttState::Recording;
-            }
-            Err(e) => self.stt_state = SttState::error(&e),
-        }
-        cx.notify();
-    }
-
-    /// Stop capture, transcribe off the UI thread (local whisper.cpp or the
-    /// provider), then paste the transcript into the focused pane.
-    fn stop_and_transcribe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(rec) = self.stt_recording.take() else {
-            self.stt_state = SttState::Idle;
-            cx.notify();
-            return;
-        };
-        let target = self.active_instance;
-        let engine = self.settings.stt_engine;
-        let model = self.settings.stt_model.clone();
-        let language = self.settings.stt_language.clone();
-        let provider_url = self.settings.stt_provider_url.clone();
-        let provider_model = self.settings.stt_provider_model.clone();
-        let autosubmit = self.settings.stt_autosubmit;
-        let wake_command = self.settings.stt_wake_command;
-        let wake_phrase = self.settings.stt_wake_phrase.clone();
-        let api_key = crate::secrets::get_stt_api_key().unwrap_or_default();
-        let models_dir = muxel_store::models_dir();
-
-        // "Downloading model…" only when the local model isn't cached yet.
-        let downloading = engine == muxel_core::SttEngine::Local
-            && models_dir.as_ref().is_none_or(|d| {
-                !d.join(muxel_core::stt::whisper_model_filename(&model))
-                    .is_file()
-            });
-        self.stt_state = SttState::Busy(if downloading {
-            t("Downloading model…").to_string()
-        } else {
-            t("Transcribing…").to_string()
-        });
-        cx.notify();
-
-        cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let (samples, rate, channels) = rec.stop()?;
-                    let audio = muxel_core::stt::resample_to_16k_mono(&samples, rate, channels);
-                    if audio.len() < (muxel_core::stt::WHISPER_RATE / 5) as usize {
-                        anyhow::bail!("no speech captured");
-                    }
-                    match engine {
-                        muxel_core::SttEngine::Local => {
-                            let dir =
-                                models_dir.ok_or_else(|| anyhow::anyhow!("no data directory"))?;
-                            let path = crate::stt::ensure_model(&model, &dir)?;
-                            crate::stt::transcribe_local(&audio, &path, &language)
-                        }
-                        muxel_core::SttEngine::Provider => {
-                            if api_key.is_empty() {
-                                anyhow::bail!("set a provider API key in Settings → Speech");
-                            }
-                            let wav = muxel_core::stt::encode_wav_16k_mono(&audio);
-                            crate::stt::transcribe_provider(
-                                &wav,
-                                &provider_url,
-                                &api_key,
-                                &provider_model,
-                                &language,
-                            )
-                        }
-                    }
-                })
-                .await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                match result {
-                    Ok(text) if !text.is_empty() => {
-                        this.stt_state = SttState::Idle;
-                        // The wake phrase is a command, not dictation — it wakes the
-                        // panes instead of being typed into one.
-                        if wake_command && muxel_core::stt::matches_wake_phrase(&text, &wake_phrase)
-                        {
-                            this.wake_all_panes(window, cx);
-                        } else {
-                            this.insert_transcript(target, &text, autosubmit, window, cx);
-                        }
-                    }
-                    Ok(_) => this.stt_state = SttState::Idle,
-                    Err(e) => this.stt_state = SttState::error(&e),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// Snapshot the voice settings for one utterance. The provider URL and key
-    /// are the Speech section's — one provider serves both transcription and
-    /// speech, so there is no second endpoint to configure. The key is left empty
-    /// here: a keychain read can block, so [`Self::begin_read_aloud`] fetches it off
-    /// the UI thread, and only for the Provider voice that needs it.
-    fn voice_config(&self) -> crate::tts::VoiceConfig {
-        crate::tts::VoiceConfig {
-            engine: self.settings.tts_engine,
-            rate: self.settings.tts_rate,
-            system_voice: self.settings.tts_system_voice.clone(),
-            local_voice: self.settings.tts_local_voice.clone(),
-            local_model: self.settings.tts_local_model.clone(),
-            provider_url: self.settings.stt_provider_url.clone(),
-            provider_model: self.settings.tts_provider_model.clone(),
-            provider_voice: self.settings.tts_provider_voice.clone(),
-            api_key: String::new(),
-            models_dir: muxel_store::models_dir(),
-        }
-    }
-
-    // --- Read aloud: speak an agent's last reply, per pane ---------------------
-
-    /// The pane the toolbar's read-aloud controls and shortcuts act on: the
-    /// focused one, when it is a live terminal.
-    fn read_aloud_target(&self) -> Option<Uuid> {
-        self.active_instance
-            .filter(|iid| self.terminals.contains_key(iid))
-    }
-
-    /// The toolbar speaker / `ReadAloud`: read the focused pane's last reply, or
-    /// pause or resume its reading.
-    fn toggle_read_aloud(&mut self, cx: &mut Context<Self>) {
-        match self.read_aloud_target() {
-            Some(iid) => self.toggle_pane_reading(iid, cx),
-            // Said, not only shown: whoever pressed this may not see the screen.
-            None => self.say_read_aloud_notice(t("Focus an agent pane first."), cx),
-        }
-    }
-
-    /// A pane's speaker: read its last reply, pause its reading, or resume it.
-    fn toggle_pane_reading(&mut self, iid: Uuid, cx: &mut Context<Self>) {
-        match self.readings.state(iid) {
-            ReadState::Playing => {
-                self.hush_read_aloud();
-                cx.notify();
-            }
-            ReadState::Paused => self.play_reading(iid, cx),
-            ReadState::Idle => {
-                if !self.read_aloud_pane(iid, cx) {
-                    self.say_read_aloud_notice(t("There's no reply to read in this pane yet."), cx);
-                }
-            }
-        }
-    }
-
-    /// Start `iid`'s reading over from its first piece — or, with no reading yet,
-    /// read its last reply.
-    fn restart_reading(&mut self, iid: Uuid, cx: &mut Context<Self>) {
-        // Hushed first: it stores the place this pane was at, which the rewind
-        // then replaces.
-        self.hush_read_aloud();
-        if self.readings.rewind(iid) {
-            self.play_reading(iid, cx);
-        } else if !self.read_aloud_pane(iid, cx) {
-            self.say_read_aloud_notice(t("There's no reply to read in this pane yet."), cx);
-        }
-    }
-
-    /// Stop `iid`'s reading and forget where it was.
-    fn stop_reading(&mut self, iid: Uuid, cx: &mut Context<Self>) {
-        if self.readings.stop(iid)
-            && let Some(speech) = self.read_aloud_speech.take()
-        {
-            speech.stop();
-        }
-        cx.notify();
-    }
-
-    /// `ReadAloudStop`: quiet, now — whatever is speaking, wherever it is — or,
-    /// with nothing speaking, drop the focused pane's paused reading.
-    fn stop_read_aloud_now(&mut self, cx: &mut Context<Self>) {
-        match self.readings.current {
-            Some((Some(iid), _)) => self.stop_reading(iid, cx),
-            Some((None, _)) => {
-                self.readings.current = None;
-                if let Some(speech) = self.read_aloud_speech.take() {
-                    speech.stop();
-                }
-                cx.notify();
-            }
-            None => {
-                if let Some(iid) = self.read_aloud_target() {
-                    self.stop_reading(iid, cx);
-                }
-            }
-        }
-    }
-
-    /// Silence the voice, keeping the place of the pane it was reading.
-    fn hush_read_aloud(&mut self) {
-        let at = self.read_aloud_speech.take().map(|speech| {
-            speech.stop();
-            speech.position()
-        });
-        self.readings.hush(at);
-    }
-
-    /// Read `iid`'s last reply from the top, as a new reading. `false` if the pane
-    /// has nothing to read from.
-    fn read_aloud_pane(&mut self, iid: Uuid, cx: &mut Context<Self>) -> bool {
-        let Some(source) = self.reply_source(iid, cx) else {
-            return false;
-        };
-        let scope = self.settings.read_aloud_scope;
-        let opts = self.settings.speak_options();
-        self.begin_read_aloud(Some(iid), cx, move || {
-            match source.utterance(scope, &opts) {
-                Some(text) => Utterance::Reading(muxel_core::readaloud::chunks(&text), 0),
-                None => {
-                    Utterance::Notice(t("There's no reply to read in this pane yet.").to_string())
-                }
-            }
-        });
-        true
-    }
-
-    /// Resume `iid`'s reading where it left off.
-    fn play_reading(&mut self, iid: Uuid, cx: &mut Context<Self>) {
-        if let Some((pieces, next)) = self.readings.resume_point(iid) {
-            self.begin_read_aloud(Some(iid), cx, move || Utterance::Reading(pieces, next));
-        }
-    }
-
-    /// Say something short about read-aloud itself, through the same voice.
-    fn say_read_aloud_notice(&mut self, notice: SharedString, cx: &mut Context<Self>) {
-        let notice = notice.to_string();
-        self.begin_read_aloud(None, cx, move || Utterance::Notice(notice));
-    }
-
-    /// What `iid`'s last reply can be found in: the terminal's buffer, the tmux
-    /// session behind it, and — for a local Claude pane — its session transcript.
-    fn reply_source(&self, iid: Uuid, cx: &App) -> Option<ReplySource> {
-        let view = self.terminals.get(&iid)?;
-        let inst = self.workspace.instance(iid)?;
-        let project = self.workspace.project(inst.project_id)?;
-        let local = project.remote.is_none();
-        let transcript = if local && is_claude_program(inst.program.as_deref()) {
-            let cwd = inst
-                .worktree_path
-                .as_deref()
-                .unwrap_or(project.root_path.as_path());
-            home_dir()
-                .zip(inst.session_id.as_deref())
-                .map(|(home, id)| muxel_core::claude_session_path(&home, cwd, id))
-        } else {
-            None
-        };
-        Some(ReplySource {
-            screen: view.read(cx).recent_text(READ_ALOUD_LINES),
-            tmux_session: inst.tmux_session.clone().filter(|_| local),
-            transcript,
-            announce: self
-                .settings
-                .read_aloud_announce
-                .then(|| tf("{name} says:", &[("name", inst.display_name())])),
-        })
-    }
-
-    /// Start a reading of `pane` (or a notice), pausing whatever was speaking:
-    /// work out what to say off the UI thread (`gather`), then speak it, keeping
-    /// the pane's controls in step until the voice is done — at which point the
-    /// next queued auto-read starts.
-    fn begin_read_aloud(
-        &mut self,
-        pane: Option<Uuid>,
-        cx: &mut Context<Self>,
-        gather: impl FnOnce() -> Utterance + Send + 'static,
-    ) {
-        self.hush_read_aloud();
-        let generation = self.readings.begin(pane);
-        let mut voice = self.voice_config();
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let (utterance, voice) = cx
-                .background_executor()
-                .spawn(async move {
-                    if voice.engine == muxel_core::TtsEngine::Provider {
-                        voice.api_key = crate::secrets::get_stt_api_key().unwrap_or_default();
-                    }
-                    (gather(), voice)
-                })
-                .await;
-            let speech = this
-                .update(cx, |this, cx| {
-                    let (pieces, from, kept) = match utterance {
-                        Utterance::Reading(pieces, from) => (pieces, from, true),
-                        Utterance::Notice(notice) => (vec![notice], 0, false),
-                    };
-                    let reading = kept.then(|| (pieces.clone(), from));
-                    // Stopped or replaced while the reply was being gathered.
-                    if !this.readings.loaded(generation, reading) {
-                        return None;
-                    }
-                    let speech = crate::tts::speak(pieces, from, voice);
-                    this.read_aloud_speech = Some(speech.clone());
-                    cx.notify();
-                    Some(speech)
-                })
-                .ok()
-                .flatten();
-            if let Some(speech) = speech {
-                while !speech.is_done() {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(200))
-                        .await;
-                }
-            }
-            let _ = this.update(cx, |this, cx| this.finish_read_aloud(generation, cx));
-        })
-        .detach();
-    }
-
-    /// A reading ended on its own: it is done (unless it was paused, stopped or
-    /// replaced first), and the next queued auto-read starts.
-    fn finish_read_aloud(&mut self, generation: u64, cx: &mut Context<Self>) {
-        if self.readings.finished(generation) {
-            self.read_aloud_speech = None;
-            while let Some(iid) = self.readings.queue.pop_front() {
-                if self.terminals.contains_key(&iid) && self.read_aloud_pane(iid, cx) {
-                    break;
-                }
-            }
-            cx.notify();
-        }
-    }
-
-    /// Auto-read: read `iid`'s new reply now if the voice is free, otherwise once
-    /// what's ahead of it is done.
-    fn enqueue_read_aloud(&mut self, iid: Uuid, cx: &mut Context<Self>) {
-        if self.readings.enqueue(iid) {
-            self.read_aloud_pane(iid, cx);
-        }
-    }
-
-    /// Read-aloud controls for pane `iid` — the toolbar's for the focused pane
-    /// (`None` when there is none), or one pane's own in its header. A speaker
-    /// while the pane has no reading; then pause (or resume), start over and stop.
-    /// `place` keeps the element ids apart; `compact` sizes them for a pane header.
-    fn read_aloud_controls(
-        &self,
-        iid: Option<Uuid>,
-        place: &str,
-        compact: bool,
-        cx: &mut Context<Self>,
-    ) -> Vec<Button> {
-        let state = iid.map_or(ReadState::Idle, |iid| self.readings.state(iid));
-        let key = iid.map(|iid| iid.simple().to_string()).unwrap_or_default();
-        let button = |what: &str| {
-            let b = Button::new(SharedString::from(format!("{place}-ra-{what}-{key}"))).ghost();
-            if compact { b.xsmall() } else { b }
-        };
-        let (icon, tip): (Icon, SharedString) = match state {
-            ReadState::Idle => (
-                Icon::empty().path("icons/volume-2.svg"),
-                t("Read the agent's last reply aloud"),
-            ),
-            ReadState::Playing => (Icon::empty().path("icons/pause.svg"), t("Pause reading")),
-            ReadState::Paused => (Icon::new(IconName::Play), t("Resume reading")),
-        };
-        let mut controls = vec![
-            button("toggle")
-                .icon(icon)
-                .selected(state == ReadState::Playing)
-                .tooltip(tip)
-                .on_click(cx.listener(move |this, _e, _w, cx| match iid {
-                    Some(iid) => this.toggle_pane_reading(iid, cx),
-                    None => this.toggle_read_aloud(cx),
-                })),
-        ];
-        if let Some(iid) = iid.filter(|_| state != ReadState::Idle) {
-            controls.push(
-                button("restart")
-                    .icon(Icon::empty().path("icons/rotate-ccw.svg"))
-                    .tooltip(t("Start reading over"))
-                    .on_click(cx.listener(move |this, _e, _w, cx| this.restart_reading(iid, cx))),
-            );
-            controls.push(
-                button("stop")
-                    .icon(Icon::empty().path("icons/circle-stop.svg"))
-                    .tooltip(t("Stop reading"))
-                    .on_click(cx.listener(move |this, _e, _w, cx| this.stop_reading(iid, cx))),
-            );
-        }
-        controls
-    }
-
-    /// Whether an agent that just finished in `iid` should be read out, per the
-    /// auto-read setting. Shells never are: every command they run "finishes".
-    fn auto_read_wanted(&self, iid: Uuid, focused: bool) -> bool {
-        let agent = self
-            .workspace
-            .instance(iid)
-            .is_some_and(|inst| muxel_core::readaloud::is_agent_program(inst.program.as_deref()));
-        agent
-            && match self.settings.read_aloud_auto {
-                muxel_core::ReadAloudAuto::Off => false,
-                muxel_core::ReadAloudAuto::Focused => focused,
-                muxel_core::ReadAloudAuto::All => true,
-            }
-    }
-
-    /// Whether `iid`'s process is up: a live view whose child hasn't exited.
-    fn is_running(&self, iid: Uuid, cx: &App) -> bool {
-        self.terminals
-            .get(&iid)
-            .is_some_and(|view| !view.read(cx).exited())
-    }
-
-    /// Relaunch `iid`'s process if it isn't running, returning whether it did.
-    /// Editor/diff/browser panes have no process of their own — left alone.
-    fn ensure_instance_running(
-        &mut self,
-        iid: Uuid,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if self.workspace.instance(iid).map(|i| i.kind) != Some(InstanceKind::Terminal)
-            || self.is_running(iid, cx)
-        {
-            return false;
-        }
-        if let Some(view) = self.terminals.remove(&iid) {
-            view.read(cx).session().kill();
-        }
-        // A wake is an explicit retry, like the toolbar's Restart: drop the sticky
-        // launch failure so the pane isn't skipped as a known-bad launch.
-        self.failed_launches.remove(&iid);
-        self.spawn_terminal(iid, window, cx);
-        true
-    }
-
-    /// The spoken wake command: walk every agent pane in the workspace in turn —
-    /// dead ones brought back, live ones passed over — and land back where the
-    /// sweep started.
-    ///
-    /// Nothing is drawn over the workspace: the panes themselves are the display,
-    /// so what you watch is the real thing coming back. The tally lands in the
-    /// notifications feed at the end.
-    ///
-    /// Only panes with a process take part; an editor has nothing to bring online.
-    /// A project shown in a secondary window keeps its own focus: its dead panes
-    /// are relaunched without stealing it into this window.
-    fn wake_all_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.waking {
-            return; // a sweep is already running
-        }
-        // Every agent pane in the workspace, in project order.
-        let targets: Vec<(Uuid, Uuid)> = self
-            .workspace
-            .projects
-            .iter()
-            .flat_map(|p| {
-                p.instances()
-                    .into_iter()
-                    .filter(|iid| {
-                        self.workspace.instance(*iid).map(|i| i.kind)
-                            == Some(InstanceKind::Terminal)
-                    })
-                    .map(|iid| (p.id, iid))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        if targets.is_empty() {
-            return; // nothing in this workspace has a process to wake
-        }
-
-        let home_pid = self.workspace.active_project;
-        let home_iid = self.active_instance;
-        self.waking = true;
-        cx.notify();
-
-        cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
-            let mut relaunched = 0usize;
-            for (pid, iid) in targets {
-                let Ok(was_dead) = this.update_in(cx, |this, window, cx| {
-                    let elsewhere = this.secondary_windows.iter().any(|s| s.pid == pid);
-                    if !elsewhere && this.workspace.active_project != Some(pid) {
-                        this.select_project(pid, window, cx);
-                    }
-                    let was_dead = this.ensure_instance_running(iid, window, cx);
-                    if !elsewhere {
-                        this.focus_instance(iid, window, cx);
-                    }
-                    cx.notify();
-                    was_dead
-                }) else {
-                    return; // window/app went away mid-sweep
-                };
-                relaunched += usize::from(was_dead);
-                cx.background_executor().timer(WAKE_STEP).await;
-            }
-
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.waking = false;
-                // Back to the pane the user was on when they spoke.
-                if let Some(pid) = home_pid.filter(|p| this.workspace.project(*p).is_some()) {
-                    if this.workspace.active_project != Some(pid) {
-                        this.select_project(pid, window, cx);
-                    }
-                    if let Some(iid) = home_iid.filter(|i| this.workspace.instance(*i).is_some()) {
-                        this.focus_instance(iid, window, cx);
-                    }
-                }
-                this.add_event(
-                    NotifKind::Success,
-                    t("Wake up — daddy's home"),
-                    wake_report(relaunched),
-                );
-                this.persist();
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// Paste a transcript into pane `iid`'s prompt (bracketed paste, so it lands
-    /// unsubmitted for review — mirrors `send_snippet_to`).
-    fn insert_transcript(
-        &mut self,
-        target: Option<Uuid>,
-        text: &str,
-        submit: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(iid) = target else { return };
-        let Some(session) = self
-            .terminals
-            .get(&iid)
-            .map(|v| v.read(cx).session().clone())
-        else {
-            return;
-        };
-        session.paste(text);
-        if submit {
-            session.write_input(b"\r");
-        }
-        self.focus_instance(iid, window, cx);
     }
 
     /// Select the Nth tab (1-based) of the active pane.
@@ -16664,21 +12829,17 @@ impl MuxelApp {
         }
     }
 
-    /// Toggle the file-browser sidebar for project `pid` (hides if already shown
-    /// for that project; otherwise selects it + loads its file list in the
-    /// background so a large repo doesn't freeze the UI).
-    /// The directory the file browser lists for a project: the remote root for a
-    /// remote project (file paths share this prefix), else the local root.
+    /// The directory the file browser lists for a project (its local root).
     fn browser_root(&self, pid: Uuid) -> PathBuf {
         self.workspace
             .project(pid)
-            .map(|p| match &p.remote {
-                Some(r) => PathBuf::from(&r.remote_root),
-                None => p.root_path.clone(),
-            })
+            .map(|p| p.root_path.clone())
             .unwrap_or_default()
     }
 
+    /// Toggle the file-browser sidebar for project `pid` (hides if already shown
+    /// for that project; otherwise selects it + loads its file list in the
+    /// background so a large repo doesn't freeze the UI).
     fn toggle_file_browser(&mut self, pid: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         if self.show_file_browser && self.file_browser_pid == Some(pid) {
             self.show_file_browser = false;
@@ -16705,30 +12866,14 @@ impl MuxelApp {
         self.file_browser_status = Arc::new(HashMap::new());
         let root = self.browser_root(pid);
         // Remote projects list over SSH (`git ls-files`/`find`); local walk otherwise.
-        let remote_loc = self
-            .workspace
-            .project(pid)
-            .is_some_and(|p| p.is_remote())
-            .then(|| self.repo_loc(pid))
-            .flatten();
-        // The repo the rows live in, for their git marks — resolves local or remote.
+        // The repo the rows live in, for their git marks.
         let git_loc = self.repo_loc(pid);
         let status_root = root.clone();
         cx.spawn(async move |this: WeakEntity<Self>, cx| {
-            let files: Vec<PathBuf> = if let Some(loc) = remote_loc {
-                cx.background_executor()
-                    .spawn(async move {
-                        integrations::list_remote_files(&loc)
-                            .into_iter()
-                            .map(PathBuf::from)
-                            .collect::<Vec<_>>()
-                    })
-                    .await
-            } else {
-                cx.background_executor()
-                    .spawn(async move { list_project_files(&root) })
-                    .await
-            };
+            let files: Vec<PathBuf> = cx
+                .background_executor()
+                .spawn(async move { list_project_files(&root) })
+                .await;
             let _ = this.update(cx, |this, cx| {
                 if this.file_browser_pid == Some(pid) {
                     this.file_browser_files = files;
@@ -16891,10 +13036,7 @@ impl MuxelApp {
         let rename_input = self.rename_input.clone();
         // Reveal-in-file-manager and on-disk rename are local-only; hide them for
         // remote projects (Open-in-terminal still works — it opens a remote shell).
-        let is_remote = self
-            .file_browser_pid
-            .and_then(|pid| self.workspace.project(pid))
-            .is_some_and(|p| p.is_remote());
+        let is_remote = false;
 
         // Git marks for the rows: which files git hasn't been told about, which are
         // modified, which are staged — folders included (see `filetree::status_index`).
@@ -17192,15 +13334,11 @@ impl MuxelApp {
             return bv.read(cx).tab_title().into();
         }
         if let Some(instance) = inst {
-            let remote = self
-                .workspace
-                .project(instance.project_id)
-                .is_some_and(Project::is_remote);
             let live_title = self.terminals.get(&iid).and_then(|v| v.read(cx).title());
             if let Some(name) = authoritative_terminal_auto_title(
                 instance,
                 &self.codex_session_names,
-                remote,
+                false,
                 live_title.as_deref(),
             ) {
                 return name.into();
@@ -17629,14 +13767,6 @@ impl MuxelApp {
                                 this.open_diff_for(iid, window, cx)
                             }))
                     }))
-                    // This pane's own read-aloud: read, pause/resume, start over, stop.
-                    .children(
-                        if kind == InstanceKind::Terminal && self.settings.read_aloud_button {
-                            self.read_aloud_controls(Some(iid), "pane", true, cx)
-                        } else {
-                            Vec::new()
-                        },
-                    )
                     .children((kind == InstanceKind::Diff).then(|| {
                         Button::new(SharedString::from(format!("refresh-{sid}")))
                             .ghost()
@@ -18052,39 +14182,6 @@ impl MuxelApp {
                                     .text_ellipsis()
                                     .child(tab_title),
                             )
-                            // A tab being read aloud says so — even when another tab
-                            // of its pane is showing — and pauses or resumes on click.
-                            .children({
-                                let reading = self.readings.state(tab);
-                                (reading != ReadState::Idle).then(|| {
-                                    let playing = reading == ReadState::Playing;
-                                    div()
-                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                            cx.stop_propagation()
-                                        })
-                                        .child(
-                                            Button::new(SharedString::from(format!(
-                                                "tabra-{}",
-                                                tab.simple()
-                                            )))
-                                            .ghost()
-                                            .xsmall()
-                                            .icon(Icon::empty().path(if playing {
-                                                "icons/volume-2.svg"
-                                            } else {
-                                                "icons/pause.svg"
-                                            }))
-                                            .tooltip(if playing {
-                                                t("Reading aloud — click to pause")
-                                            } else {
-                                                t("Reading paused — click to resume")
-                                            })
-                                            .on_click(cx.listener(move |this, _e, _w, cx| {
-                                                this.toggle_pane_reading(tab, cx)
-                                            })),
-                                        )
-                                })
-                            })
                             .child(
                                 // stop_propagation so closing a tab isn't a focus/drag.
                                 div()
@@ -18488,30 +14585,6 @@ impl MuxelApp {
                     .child(bullet(
                         &t("muxel runs locally on your machine and collects no personal data."),
                     )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        Button::new("terms-full")
-                            .ghost()
-                            .label(t("View full terms"))
-                            .on_click(cx.listener(|_t, _e, _w, cx| {
-                                cx.open_url("https://muxel.sh/legal.html")
-                            })),
-                    )
-                    .child(
-                        Button::new("terms-license")
-                            .ghost()
-                            .label(t("License (GPL-3.0)"))
-                            .on_click(cx.listener(|_t, _e, _w, cx| {
-                                cx.open_url(
-                                    "https://github.com/projecthax/muxel/blob/master/LICENSE",
-                                )
-                            })),
-                    ),
             )
             .child(
                 div()
@@ -19641,8 +15714,7 @@ impl MuxelApp {
             let has_startup = !project.startup.is_empty();
             let memory_on = project.memory_enabled;
             let is_repo = self.project_branches.get(&pid).is_some_and(|b| b.is_some());
-            let is_local = project.remote.is_none();
-            let remote_host_id = project.remote.as_ref().map(|r| r.host_id);
+            let is_local = true;
             let current_branch = self.project_branches.get(&pid).cloned().flatten();
             let branches = self
                 .project_branch_lists
@@ -19721,13 +15793,6 @@ impl MuxelApp {
                             .flex()
                             .items_center()
                             .gap_1()
-                            .children(project.is_remote().then(|| {
-                                // Remote (SSH) project badge.
-                                Icon::new(IconName::Network)
-                                    .small()
-                                    .flex_none()
-                                    .text_color(cx.theme().muted_foreground)
-                            }))
                             .child(
                                 // Name yields/truncates; the branch chip at the end
                                 // stays full.
@@ -19884,32 +15949,6 @@ impl MuxelApp {
                                         ),
                                     ),
                                 );
-                            // Remote projects: reconnect a dropped/failed SSH
-                            // connection, or scan the host for more projects.
-                            if let Some(hid) = remote_host_id {
-                                menu = menu
-                                    .separator()
-                                    .item(
-                                        PopupMenuItem::new(t("Reconnect"))
-                                            .icon(IconName::Redo)
-                                            .on_click(window.listener_for(
-                                                &entity,
-                                                move |this, _, window, cx| {
-                                                    this.reconnect_project(pid, window, cx)
-                                                },
-                                            )),
-                                    )
-                                    .item(
-                                        PopupMenuItem::new(t("Scan for projects"))
-                                            .icon(IconName::Search)
-                                            .on_click(window.listener_for(
-                                                &entity,
-                                                move |this, _, window, cx| {
-                                                    this.open_remote_scan(hid, window, cx)
-                                                },
-                                            )),
-                                    );
-                            }
                             // Multi-monitor: open this project as a full muxel
                             // window on another display, or pull it back.
                             let displays = cx.displays();
@@ -20228,15 +16267,11 @@ impl MuxelApp {
                         // Agent titles have no such prefix and pass through unchanged.
                         (
                             inst.and_then(|instance| {
-                                let remote = self
-                                    .workspace
-                                    .project(instance.project_id)
-                                    .is_some_and(Project::is_remote);
                                 let live_title = view.title();
                                 authoritative_terminal_auto_title(
                                     instance,
                                     &self.codex_session_names,
-                                    remote,
+                                    false,
                                     live_title.as_deref(),
                                 )
                             })
@@ -20448,17 +16483,6 @@ impl MuxelApp {
                                 this.new_project_dialog(window, cx);
                             })),
                     ),
-                )
-                .child(
-                    div().flex_none().child(
-                        Button::new("new-remote-project")
-                            .ghost()
-                            .icon(IconName::Network)
-                            .tooltip(t("New remote project (SSH)"))
-                            .on_click(cx.listener(|this, _ev, window, cx| {
-                                this.open_remote_project_modal(window, cx);
-                            })),
-                    ),
                 ),
         )
     }
@@ -20611,22 +16635,6 @@ impl MuxelApp {
                     .tooltip(t("Close pane"))
                     .on_click(cx.listener(|this, _ev, window, cx| this.close_active(window, cx))),
             )
-            .child(
-                Button::new("speech-to-text")
-                    .ghost()
-                    .icon(Icon::empty().path("icons/mic.svg"))
-                    .selected(self.stt_state == SttState::Recording)
-                    .disabled(matches!(self.stt_state, SttState::Busy(_)))
-                    .tooltip(t("Dictate to the focused agent"))
-                    .on_click(cx.listener(|this, _ev, window, cx| this.toggle_speech(window, cx))),
-            )
-            // Read-aloud for the focused pane: its speaker, then pause / resume,
-            // start over and stop once it has a reading.
-            .children(if self.settings.read_aloud_button {
-                self.read_aloud_controls(self.read_aloud_target(), "tb", false, cx)
-            } else {
-                Vec::new()
-            })
             // Spacer pushes the git-diff toggle to the far right of the toolbar.
             .child(div().flex_1())
             .child(
@@ -21064,22 +17072,6 @@ impl MuxelApp {
                     ))
                     .child(div().flex_1())
                     .child(nodrag(
-                        Button::new("update")
-                            .ghost()
-                            .icon(IconName::ArrowUp)
-                            .selected(self.update_pending())
-                            .tooltip(if matches!(self.update_state, UpdateState::Checking) {
-                                t("Checking for updates…")
-                            } else if self.update_pending() {
-                                t("Update available")
-                            } else {
-                                t("Check for updates")
-                            })
-                            .on_click(
-                                cx.listener(|this, _ev, _window, cx| this.open_update_modal(cx)),
-                            ),
-                    ))
-                    .child(nodrag(
                         Button::new("workspaces")
                             .ghost()
                             .icon(IconName::CircleUser)
@@ -21117,15 +17109,6 @@ impl MuxelApp {
                             .on_click(
                                 cx.listener(|this, _ev, _window, cx| this.toggle_notifications(cx)),
                             ),
-                    ))
-                    .child(nodrag(
-                        Button::new("donate")
-                            .ghost()
-                            .icon(IconName::Heart)
-                            .tooltip(t("Support muxel"))
-                            .on_click(cx.listener(|_t, _ev, _window, cx| {
-                                cx.open_url("https://donate.stripe.com/bJeaEX2OVaE68Fae7X8k80X")
-                            })),
                     )),
             )
     }
@@ -21182,9 +17165,6 @@ impl MuxelApp {
                 notifications: self.notifications_enabled,
             });
             self.load_appearance_inputs(window, cx);
-            self.load_speech_inputs(window, cx);
-            self.load_read_aloud_inputs(window, cx);
-            self.load_system_voices(cx);
             self.load_keybinding_inputs(window, cx);
         }
         cx.notify();
@@ -21277,848 +17257,8 @@ impl MuxelApp {
         cx.notify();
     }
 
-    // ===== Speech-to-text settings handlers =====
-
-    /// Seed the Speech section's text inputs from the current settings + keychain.
-    fn load_speech_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let url = self.settings.stt_provider_url.clone();
-        self.settings_ui
-            .stt_provider_url
-            .update(cx, |s, cx| s.set_value(url, window, cx));
-        let model = self.settings.stt_provider_model.clone();
-        self.settings_ui
-            .stt_provider_model
-            .update(cx, |s, cx| s.set_value(model, window, cx));
-        let lang = self.settings.stt_language.clone();
-        self.settings_ui
-            .stt_language
-            .update(cx, |s, cx| s.set_value(lang, window, cx));
-        let phrase = self.settings.stt_wake_phrase.clone();
-        self.settings_ui
-            .stt_wake_phrase
-            .update(cx, |s, cx| s.set_value(phrase, window, cx));
-        self.settings_ui
-            .stt_api_key
-            .update(cx, |s, cx| s.set_value("", window, cx));
-        self.settings_ui.stt_has_key = crate::secrets::has_stt_api_key();
-    }
-
-    /// Read the wake-phrase input and persist it. A phrase of only punctuation
-    /// normalizes to nothing and could never match, so blanking it restores the
-    /// default rather than silently disabling the command.
-    fn apply_stt_wake_phrase(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let typed = self
-            .settings_ui
-            .stt_wake_phrase
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        self.settings.stt_wake_phrase = if muxel_core::stt::normalize_spoken(&typed).is_empty() {
-            let restored = muxel_core::stt::DEFAULT_WAKE_PHRASE.to_string();
-            self.settings_ui
-                .stt_wake_phrase
-                .update(cx, |s, cx| s.set_value(restored.clone(), window, cx));
-            restored
-        } else {
-            typed
-        };
-        self.persist_settings();
-        cx.notify();
-    }
-
-    fn set_stt_engine(&mut self, engine: muxel_core::SttEngine, cx: &mut Context<Self>) {
-        self.settings.stt_engine = engine;
-        self.persist_settings();
-        cx.notify();
-    }
-
-    fn set_stt_model(&mut self, model: &str, cx: &mut Context<Self>) {
-        self.settings.stt_model = model.to_string();
-        self.persist_settings();
-        cx.notify();
-    }
-
-    /// Read the provider URL / model / language inputs and persist them.
-    fn apply_stt_provider(&mut self, cx: &mut Context<Self>) {
-        let url = self
-            .settings_ui
-            .stt_provider_url
-            .read(cx)
-            .value()
-            .to_string();
-        let url = url.trim();
-        self.settings.stt_provider_url = if url.is_empty() {
-            "https://api.openai.com/v1".to_string()
-        } else {
-            url.to_string()
-        };
-        let model = self
-            .settings_ui
-            .stt_provider_model
-            .read(cx)
-            .value()
-            .to_string();
-        self.settings.stt_provider_model = model.trim().to_string();
-        let lang = self.settings_ui.stt_language.read(cx).value().to_string();
-        self.settings.stt_language = lang.trim().to_string();
-        self.persist_settings();
-        cx.notify();
-    }
-
-    /// Store the typed API key in the OS keychain, then clear the input.
-    fn save_stt_api_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let key = self
-            .settings_ui
-            .stt_api_key
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        if key.is_empty() {
-            return;
-        }
-        match crate::secrets::set_stt_api_key(&key) {
-            Ok(()) => {
-                self.settings_ui.stt_has_key = true;
-                self.settings_ui
-                    .stt_api_key
-                    .update(cx, |s, cx| s.set_value("", window, cx));
-                self.add_event(
-                    NotifKind::Success,
-                    t("API key saved to keychain").to_string(),
-                    String::new(),
-                );
-            }
-            Err(e) => self.add_event(
-                NotifKind::Error,
-                t("Couldn't save API key").to_string(),
-                format!("{e:#}"),
-            ),
-        }
-        cx.notify();
-    }
-
-    fn clear_stt_api_key(&mut self, cx: &mut Context<Self>) {
-        let _ = crate::secrets::delete_stt_api_key();
-        self.settings_ui.stt_has_key = false;
-        cx.notify();
-    }
-
-    fn stt_engine_btn(
-        &self,
-        value: muxel_core::SttEngine,
-        label: &str,
-        cx: &mut Context<Self>,
-    ) -> Button {
-        let id = SharedString::from(format!("stt-engine-{label}"));
-        Button::new(id)
-            .ghost()
-            .selected(self.settings.stt_engine == value)
-            .label(label.to_string())
-            .on_click(cx.listener(move |this, _e, _w, cx| this.set_stt_engine(value, cx)))
-    }
-
-    fn render_settings_speech(&self, cx: &mut Context<Self>) -> AnyElement {
-        let is_local = self.settings.stt_engine == muxel_core::SttEngine::Local;
-        let models = ["tiny", "base", "small", "medium"];
-        let current_model = self.settings.stt_model.clone();
-        let mut model_row = div().flex().flex_wrap().gap_1();
-        for m in models {
-            let selected = current_model == m;
-            model_row = model_row.child(
-                Button::new(SharedString::from(format!("stt-model-{m}")))
-                    .ghost()
-                    .selected(selected)
-                    .label(m)
-                    .on_click(cx.listener(move |this, _e, _w, cx| this.set_stt_model(m, cx))),
-            );
-        }
-
-        let mut col = v_flex()
-            .gap_3()
-            .max_w(px(560.0))
-            .child(self.settings_label(&t("Dictation engine"), cx))
-            .child(
-                div()
-                    .flex()
-                    .gap_1()
-                    .child(self.stt_engine_btn(muxel_core::SttEngine::Local, &t("Local"), cx))
-                    .child(self.stt_engine_btn(
-                        muxel_core::SttEngine::Provider,
-                        &t("Provider"),
-                        cx,
-                    )),
-            );
-
-        if is_local {
-            col = col
-                .child(self.settings_label(
-                    &t("Local model (whisper.cpp) — downloaded on first use"),
-                    cx,
-                ))
-                .child(model_row);
-        } else {
-            col = col
-                .child(self.settings_label(&t("Provider base URL (OpenAI-compatible)"), cx))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .child(Input::new(&self.settings_ui.stt_provider_url)),
-                        )
-                        .child(
-                            Button::new("stt-apply-provider")
-                                .primary()
-                                .label(t("Apply"))
-                                .on_click(
-                                    cx.listener(|this, _e, _w, cx| this.apply_stt_provider(cx)),
-                                ),
-                        ),
-                )
-                .child(self.settings_label(&t("Provider model"), cx))
-                .child(Self::wide_input(Input::new(
-                    &self.settings_ui.stt_provider_model,
-                )))
-                .child(self.settings_label(
-                    &if self.settings_ui.stt_has_key {
-                        t("API key — a key is stored; type a new one to replace it")
-                    } else {
-                        t("API key — stored in the OS keychain")
-                    },
-                    cx,
-                ))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .child(Input::new(&self.settings_ui.stt_api_key)),
-                        )
-                        .child(
-                            Button::new("stt-save-key")
-                                .primary()
-                                .label(t("Save"))
-                                .on_click(cx.listener(|this, _e, window, cx| {
-                                    this.save_stt_api_key(window, cx)
-                                })),
-                        )
-                        .children(self.settings_ui.stt_has_key.then(|| {
-                            Button::new("stt-clear-key")
-                                .ghost()
-                                .label(t("Remove"))
-                                .on_click(
-                                    cx.listener(|this, _e, _w, cx| this.clear_stt_api_key(cx)),
-                                )
-                        })),
-                );
-        }
-
-        col.child(self.settings_label(
-            &t("Spoken language (BCP-47, e.g. en) — blank auto-detects"),
-            cx,
-        ))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(v_flex().flex_1().child(Input::new(&self.settings_ui.stt_language)))
-                .child(
-                    Button::new("stt-apply-lang")
-                        .primary()
-                        .label(t("Apply"))
-                        .on_click(cx.listener(|this, _e, _w, cx| this.apply_stt_provider(cx))),
-                ),
-        )
-        .child(
-            self.check_row(
-                Checkbox::new("stt-autosubmit")
-                    .checked(self.settings.stt_autosubmit)
-                    .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                        this.settings.stt_autosubmit = *c;
-                        this.persist_settings();
-                        cx.notify();
-                    })),
-                &t("Press Enter automatically after inserting the transcript"),
-            ),
-        )
-        .child(
-            self.check_row(
-                Checkbox::new("stt-wake-command")
-                    .checked(self.settings.stt_wake_command)
-                    .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                        this.settings.stt_wake_command = *c;
-                        this.persist_settings();
-                        cx.notify();
-                    })),
-                &t("Dictating the wake phrase sweeps every pane and relaunches the ones that aren't running"),
-            ),
-        )
-        .children(self.settings.stt_wake_command.then(|| {
-            v_flex()
-                .gap_3()
-                .child(self.settings_label(&t("Wake phrase"), cx))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .child(Input::new(&self.settings_ui.stt_wake_phrase)),
-                        )
-                        .child(
-                            Button::new("stt-apply-wake-phrase")
-                                .primary()
-                                .label(t("Apply"))
-                                .on_click(cx.listener(|this, _e, window, cx| {
-                                    this.apply_stt_wake_phrase(window, cx)
-                                })),
-                        ),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(t(
-                            "Matched on whole words, ignoring case and punctuation. The transcript that triggers it is not typed into the pane.",
-                        )),
-                )
-        }))
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(t(
-                    "Provider mode uploads your recorded audio to the endpoint above. Local mode runs entirely on this machine.",
-                )),
-        )
-        .into_any_element()
-    }
-
-    // ===== Read-aloud settings =====
-
-    /// Seed the Read Aloud section's text inputs from the current settings.
-    fn load_read_aloud_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let voice = self.settings.tts_system_voice.clone();
-        self.settings_ui
-            .tts_system_voice
-            .update(cx, |s, cx| s.set_value(voice, window, cx));
-        let voice = self.settings.tts_provider_voice.clone();
-        self.settings_ui
-            .tts_provider_voice
-            .update(cx, |s, cx| s.set_value(voice, window, cx));
-        let model = self.settings.tts_provider_model.clone();
-        self.settings_ui
-            .tts_provider_model
-            .update(cx, |s, cx| s.set_value(model, window, cx));
-    }
-
-    /// List the OS voices once, in the background, for the voice picker.
-    fn load_system_voices(&mut self, cx: &mut Context<Self>) {
-        if self.settings_ui.tts_system_voices.is_some() {
-            return;
-        }
-        cx.spawn(async move |this, cx| {
-            let voices = cx
-                .background_executor()
-                .spawn(async { crate::tts::system_voice_list() })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.settings_ui.tts_system_voices = Some(voices);
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    /// The voice picker's choice (empty = the OS default voice).
-    fn set_system_voice(&mut self, name: String, cx: &mut Context<Self>) {
-        self.settings.tts_system_voice = name;
-        self.persist_settings();
-        cx.notify();
-    }
-
-    /// Read the typed OS voice name (where the OS can't list its voices).
-    fn apply_tts_system_voice(&mut self, cx: &mut Context<Self>) {
-        let voice = self
-            .settings_ui
-            .tts_system_voice
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        self.set_system_voice(voice, cx);
-    }
-
-    /// Read the provider voice + model inputs; a blank one restores its default.
-    fn apply_tts_provider(&mut self, cx: &mut Context<Self>) {
-        let voice = self
-            .settings_ui
-            .tts_provider_voice
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        self.settings.tts_provider_voice = if voice.is_empty() {
-            muxel_core::tts::DEFAULT_TTS_VOICE.to_string()
-        } else {
-            voice
-        };
-        let model = self
-            .settings_ui
-            .tts_provider_model
-            .read(cx)
-            .value()
-            .trim()
-            .to_string();
-        self.settings.tts_provider_model = if model.is_empty() {
-            muxel_core::tts::DEFAULT_TTS_PROVIDER_MODEL.to_string()
-        } else {
-            model
-        };
-        self.persist_settings();
-        cx.notify();
-    }
-
-    fn adjust_tts_rate(&mut self, delta: f32, cx: &mut Context<Self>) {
-        let rate = ((self.settings.tts_rate + delta) * 10.0).round() / 10.0;
-        self.settings.tts_rate = muxel_core::tts::clamp_rate(rate);
-        self.persist_settings();
-        cx.notify();
-    }
-
     /// One choice in a row of mutually exclusive setting buttons: `pick` applies
     /// it to the settings, which are then saved.
-    fn option_btn(
-        &self,
-        id: impl Into<ElementId>,
-        label: SharedString,
-        selected: bool,
-        cx: &mut Context<Self>,
-        pick: impl Fn(&mut muxel_core::Settings) + 'static,
-    ) -> Button {
-        Button::new(id)
-            .ghost()
-            .selected(selected)
-            .label(label)
-            .on_click(cx.listener(move |this, _e, _w, cx| {
-                pick(&mut this.settings);
-                this.persist_settings();
-                cx.notify();
-            }))
-    }
-
-    /// A settings checkbox bound to one boolean setting.
-    fn setting_check(
-        &self,
-        id: &'static str,
-        checked: bool,
-        label: &str,
-        cx: &mut Context<Self>,
-        set: impl Fn(&mut muxel_core::Settings, bool) + 'static,
-    ) -> impl IntoElement {
-        self.check_row(
-            Checkbox::new(id).checked(checked).on_click(cx.listener(
-                move |this, c: &bool, _w, cx| {
-                    set(&mut this.settings, *c);
-                    this.persist_settings();
-                    cx.notify();
-                },
-            )),
-            label,
-        )
-    }
-
-    fn render_settings_read_aloud(&self, cx: &mut Context<Self>) -> AnyElement {
-        use muxel_core::{ReadAloudAuto, ReadAloudScope, TtsEngine};
-        let settings = &self.settings;
-        let muted = cx.theme().muted_foreground;
-        let note = |text: SharedString| div().text_xs().text_color(muted).child(text);
-
-        // A shortcut as the user has it bound.
-        let chord = |action: &str| {
-            settings
-                .keybindings
-                .iter()
-                .find(|k| k.action == action)
-                .map(|k| k.keystroke.clone())
-                .or_else(|| {
-                    settings_view::DEFAULT_KEYBINDINGS
-                        .iter()
-                        .find(|(name, _, _)| *name == action)
-                        .map(|(_, default, _)| default.to_string())
-                })
-                .map(|ks| prettify_keys(&ks))
-                .unwrap_or_default()
-        };
-
-        let scope = settings.read_aloud_scope;
-        let auto = settings.read_aloud_auto;
-        let max = settings.read_aloud_max_chars;
-        let engine = settings.tts_engine;
-
-        let mut col = v_flex()
-            .gap_3()
-            .max_w(px(560.0))
-            .child(note(
-                tf(
-                    "Press {keys}, or a speaker (in the toolbar for the focused pane, or on any pane), to hear the agent's last reply. Press it again to pause, and again to resume — each pane keeps its own place, picking up at the start of the sentence it paused in. {restart} starts over; {stop} stops.",
-                    &[
-                        ("keys", &chord("ReadAloud")),
-                        ("restart", &chord("ReadAloudRestart")),
-                        ("stop", &chord("ReadAloudStop")),
-                    ],
-                )
-                .into(),
-            ))
-            .child(self.setting_check(
-                "ra-button",
-                settings.read_aloud_button,
-                &t("Show read-aloud buttons in the toolbar and on each pane"),
-                cx,
-                |s, on| s.read_aloud_button = on,
-            ))
-            // --- What is read ---
-            .child(self.settings_label(&t("What to read"), cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_1()
-                    .child(self.option_btn(
-                        "ra-scope-final",
-                        t("Final message"),
-                        scope == ReadAloudScope::FinalMessage,
-                        cx,
-                        |s| s.read_aloud_scope = ReadAloudScope::FinalMessage,
-                    ))
-                    .child(self.option_btn(
-                        "ra-scope-turn",
-                        t("Whole last turn"),
-                        scope == ReadAloudScope::WholeTurn,
-                        cx,
-                        |s| s.read_aloud_scope = ReadAloudScope::WholeTurn,
-                    )),
-            )
-            .child(note(t(
-                "The final message is what the agent wrote after its last tool call — usually its summary. Code, diffs, commands and tool output are never read, only the agent's own words.",
-            )))
-            .child(self.settings_label(&t("Read automatically when an agent finishes"), cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_1()
-                    .child(self.option_btn(
-                        "ra-auto-off",
-                        t("Off"),
-                        auto == ReadAloudAuto::Off,
-                        cx,
-                        |s| s.read_aloud_auto = ReadAloudAuto::Off,
-                    ))
-                    .child(self.option_btn(
-                        "ra-auto-focused",
-                        t("Focused pane"),
-                        auto == ReadAloudAuto::Focused,
-                        cx,
-                        |s| s.read_aloud_auto = ReadAloudAuto::Focused,
-                    ))
-                    .child(self.option_btn(
-                        "ra-auto-all",
-                        t("Any agent"),
-                        auto == ReadAloudAuto::All,
-                        cx,
-                        |s| s.read_aloud_auto = ReadAloudAuto::All,
-                    )),
-            )
-            .child(self.setting_check(
-                "ra-announce",
-                settings.read_aloud_announce,
-                &t("Say the agent's name before its reply"),
-                cx,
-                |s, on| s.read_aloud_announce = on,
-            ))
-            .child(self.settings_label(&t("Length limit"), cx));
-
-        let mut limits = div().flex().flex_wrap().gap_1();
-        for (chars, label) in [
-            (0, t("No limit")),
-            (500, t("About 30 s")),
-            (1000, t("About 1 min")),
-            (3000, t("About 3 min")),
-        ] {
-            limits = limits.child(self.option_btn(
-                SharedString::from(format!("ra-max-{chars}")),
-                label,
-                max == chars,
-                cx,
-                move |s| s.read_aloud_max_chars = chars,
-            ));
-        }
-        col =
-            col.child(limits)
-                .child(note(t(
-                    "A long reply stops at the end of a sentence once the limit is reached.",
-                )))
-                // --- How it's cleaned up ---
-                .child(self.settings_label(&t("Clean-up"), cx))
-                .child(self.setting_check(
-                    "ra-urls",
-                    settings.read_aloud_skip_urls,
-                    &t("Say \u{201c}link\u{201d} instead of reading web addresses"),
-                    cx,
-                    |s, on| s.read_aloud_skip_urls = on,
-                ))
-                .child(self.setting_check(
-                    "ra-paths",
-                    settings.read_aloud_short_paths,
-                    &t("Say only the file name of a path (src/app.rs:120 \u{2192} app.rs)"),
-                    cx,
-                    |s, on| s.read_aloud_short_paths = on,
-                ))
-                .child(self.setting_check(
-                    "ra-tables",
-                    settings.read_aloud_tables,
-                    &t("Read tables row by row (off skips them)"),
-                    cx,
-                    |s, on| s.read_aloud_tables = on,
-                ))
-                // --- The voice ---
-                .child(self.settings_label(&t("Voice"), cx))
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap_1()
-                        .child(self.option_btn(
-                            "ra-engine-system",
-                            t("System"),
-                            engine == TtsEngine::System,
-                            cx,
-                            |s| s.tts_engine = TtsEngine::System,
-                        ))
-                        .children(
-                            (crate::tts::local_voice_supported() || engine == TtsEngine::Local)
-                                .then(|| {
-                                    self.option_btn(
-                                        "ra-engine-local",
-                                        t("Local (Kokoro)"),
-                                        engine == TtsEngine::Local,
-                                        cx,
-                                        |s| s.tts_engine = TtsEngine::Local,
-                                    )
-                                }),
-                        )
-                        .child(self.option_btn(
-                            "ra-engine-provider",
-                            t("Provider"),
-                            engine == TtsEngine::Provider,
-                            cx,
-                            |s| s.tts_engine = TtsEngine::Provider,
-                        )),
-                );
-
-        col = match engine {
-            TtsEngine::System => {
-                let listed = self
-                    .settings_ui
-                    .tts_system_voices
-                    .as_ref()
-                    .filter(|voices| !voices.is_empty());
-                match listed {
-                    Some(voices) => {
-                        let current = if settings.tts_system_voice.is_empty() {
-                            t("OS default voice")
-                        } else {
-                            SharedString::from(settings.tts_system_voice.clone())
-                        };
-                        let choices: Vec<(String, String)> = muxel_core::tts::voices_for_language(
-                            voices,
-                            &crate::i18n::current_language(),
-                        )
-                        .into_iter()
-                        .cloned()
-                        .collect();
-                        col.child(self.settings_label(&t("System voice"), cx)).child(
-                            DropdownButton::new("ra-system-voice")
-                                .button(
-                                    Button::new("ra-system-voice-btn")
-                                        .ghost()
-                                        .icon(Icon::empty().path("icons/volume-2.svg"))
-                                        .label(current),
-                                )
-                                .dropdown_menu(move |mut menu, _window, _cx| {
-                                    menu = menu.menu(
-                                        t("OS default voice"),
-                                        Box::new(SetSystemVoice(String::new())),
-                                    );
-                                    for (name, locale) in &choices {
-                                        menu = menu.menu(
-                                            format!("{name} ({locale})"),
-                                            Box::new(SetSystemVoice(name.clone())),
-                                        );
-                                    }
-                                    menu.scrollable(true)
-                                }),
-                        )
-                    }
-                    None => col
-                        .child(self.settings_label(
-                            &t("System voice name (blank = the OS default voice)"),
-                            cx,
-                        ))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    v_flex()
-                                        .flex_1()
-                                        .child(Input::new(&self.settings_ui.tts_system_voice)),
-                                )
-                                .child(
-                                    Button::new("ra-apply-system-voice")
-                                        .primary()
-                                        .label(t("Apply"))
-                                        .on_click(cx.listener(|this, _e, _w, cx| {
-                                            this.apply_tts_system_voice(cx)
-                                        })),
-                                ),
-                        ),
-                }
-            }
-            TtsEngine::Local => {
-                let mut voices = div().flex().flex_wrap().gap_1();
-                for voice in muxel_core::tts::KOKORO_VOICES {
-                    voices = voices.child(self.option_btn(
-                        SharedString::from(format!("ra-kokoro-{voice}")),
-                        SharedString::from(*voice),
-                        settings.tts_local_voice == *voice,
-                        cx,
-                        move |s| s.tts_local_voice = voice.to_string(),
-                    ));
-                }
-                col.child(self.settings_label(&t("Kokoro voice"), cx))
-                    .child(voices)
-                    .child(note(t(
-                        "Runs offline on this machine. The model (about 90 MB) downloads the first time it speaks. Speaks at its own pace.",
-                    )))
-            }
-            TtsEngine::Provider => col
-                .child(self.settings_label(&t("Provider voice (alloy, echo, nova, onyx, shimmer, …)"), cx))
-                .child(Self::wide_input(Input::new(&self.settings_ui.tts_provider_voice)))
-                .child(self.settings_label(&t("Provider model"), cx))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .child(Input::new(&self.settings_ui.tts_provider_model)),
-                        )
-                        .child(
-                            Button::new("ra-apply-provider")
-                                .primary()
-                                .label(t("Apply"))
-                                .on_click(
-                                    cx.listener(|this, _e, _w, cx| this.apply_tts_provider(cx)),
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(note(t(
-                            "Uses the provider URL and API key from Speech. The reply's text is sent to that endpoint.",
-                        )))
-                        .child(
-                            Button::new("ra-open-speech")
-                                .ghost()
-                                .xsmall()
-                                .label(t("Speech settings"))
-                                .on_click(cx.listener(|this, _e, _w, cx| {
-                                    this.set_section(SettingsSection::Speech, cx)
-                                })),
-                        ),
-                ),
-        };
-
-        let rate_note = if engine == TtsEngine::Local {
-            t("Speaking rate (System and Provider voices)")
-        } else {
-            t("Speaking rate")
-        };
-        col.child(self.settings_label(&rate_note, cx))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        Button::new("ra-rate-dec").ghost().label("−").on_click(
-                            cx.listener(|this, _e, _w, cx| this.adjust_tts_rate(-0.1, cx)),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .w(rems(4.0))
-                            .text_center()
-                            .child(format!("{:.1}×", settings.tts_rate)),
-                    )
-                    .child(
-                        Button::new("ra-rate-inc").ghost().label("+").on_click(
-                            cx.listener(|this, _e, _w, cx| this.adjust_tts_rate(0.1, cx)),
-                        ),
-                    )
-                    .child(
-                        Button::new("ra-rate-reset")
-                            .ghost()
-                            .small()
-                            .label(t("Normal"))
-                            .disabled((settings.tts_rate - 1.0).abs() < 0.05)
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.settings.tts_rate = 1.0;
-                                this.persist_settings();
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                div().child(
-                    Button::new("ra-test-voice")
-                        .ghost()
-                        .small()
-                        .icon(Icon::empty().path("icons/volume-2.svg"))
-                        .label(t("Test voice"))
-                        .tooltip(t("Hear a sample with these settings"))
-                        .on_click(cx.listener(|this, _e, _w, cx| {
-                            this.say_read_aloud_notice(
-                                t("This is how muxel reads an agent's reply aloud."),
-                                cx,
-                            )
-                        })),
-                ),
-            )
-            .into_any_element()
-    }
-
-    // ===== Editor settings handlers =====
-
     fn apply_editor_font_family(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings.editor_font_family = self
             .settings_ui
@@ -22830,382 +17970,6 @@ impl MuxelApp {
         let v = self.settings_ui.l_presses as i8 + delta;
         self.settings_ui.l_presses = v.clamp(0, 9) as u8;
         cx.notify();
-    }
-
-    // --- SSH remote hosts ---
-
-    fn open_remote_editor(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(h) = self.remotes.get(idx).cloned() else {
-            return;
-        };
-        self.settings_ui.selected_remote = Some(idx);
-        self.settings_ui.s_auth = h.auth;
-        self.settings_ui.s_test = RemoteTestState::Idle;
-        self.settings_ui.s_has_password = crate::secrets::has_remote_password(h.id);
-        self.settings_ui.s_identity_id = h.identity_id;
-        self.settings_ui.s_forward_agent = h.forward_agent;
-        self.settings_ui.s_compression = h.compression;
-        self.settings_ui.s_use_tmux = h.default_use_tmux;
-        self.settings_ui.s_remote_os = h.os;
-        self.settings_ui.s_windows_shell = h.windows_shell;
-        let set =
-            |inp: &Entity<InputState>, v: String, cx: &mut Context<Self>, window: &mut Window| {
-                inp.update(cx, |s, cx| s.set_value(v, window, cx));
-            };
-        set(&self.settings_ui.s_name, h.name.clone(), cx, window);
-        set(&self.settings_ui.s_host, h.hostname.clone(), cx, window);
-        set(
-            &self.settings_ui.s_port,
-            h.port.map(|p| p.to_string()).unwrap_or_default(),
-            cx,
-            window,
-        );
-        set(&self.settings_ui.s_user, h.user.clone(), cx, window);
-        set(
-            &self.settings_ui.s_identity,
-            h.identity_file
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-            cx,
-            window,
-        );
-        // Never preload the password — it stays in the keychain.
-        set(&self.settings_ui.s_password, String::new(), cx, window);
-        set(
-            &self.settings_ui.s_jump,
-            h.jump_host.clone().unwrap_or_default(),
-            cx,
-            window,
-        );
-        set(
-            &self.settings_ui.s_keepalive,
-            h.keepalive_secs.map(|k| k.to_string()).unwrap_or_default(),
-            cx,
-            window,
-        );
-        set(
-            &self.settings_ui.s_strict,
-            h.strict_host_key.clone(),
-            cx,
-            window,
-        );
-        set(
-            &self.settings_ui.s_extra,
-            h.extra_options.join("\n"),
-            cx,
-            window,
-        );
-        cx.notify();
-    }
-
-    fn set_remote_auth(&mut self, auth: SshAuth, cx: &mut Context<Self>) {
-        self.settings_ui.s_auth = auth;
-        cx.notify();
-    }
-
-    /// Pick an SSH identity file via the OS file dialog, into the host editor.
-    fn browse_identity_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some(t("Choose key")),
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(mut paths))) = receiver.await
-                && let Some(path) = paths.pop()
-            {
-                let _ = this.update_in(cx, |this, window, cx| {
-                    this.settings_ui.s_identity.update(cx, |s, cx| {
-                        s.set_value(path.display().to_string(), window, cx)
-                    });
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
-    }
-
-    fn save_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(idx) = self.settings_ui.selected_remote else {
-            return;
-        };
-        let ui = &self.settings_ui;
-        let name = ui.s_name.read(cx).value().trim().to_string();
-        let hostname = ui.s_host.read(cx).value().trim().to_string();
-        let port = ui.s_port.read(cx).value().trim().parse::<u16>().ok();
-        let user = ui.s_user.read(cx).value().trim().to_string();
-        let identity = {
-            let v = ui.s_identity.read(cx).value().trim().to_string();
-            (!v.is_empty()).then(|| PathBuf::from(v))
-        };
-        let password = ui.s_password.read(cx).value().to_string();
-        let jump = {
-            let v = ui.s_jump.read(cx).value().trim().to_string();
-            (!v.is_empty()).then_some(v)
-        };
-        let keepalive = ui.s_keepalive.read(cx).value().trim().parse::<u32>().ok();
-        let strict = ui.s_strict.read(cx).value().trim().to_string();
-        let extra: Vec<String> = ui
-            .s_extra
-            .read(cx)
-            .value()
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect();
-        let auth = ui.s_auth;
-        let forward_agent = ui.s_forward_agent;
-        let compression = ui.s_compression;
-        let use_tmux = ui.s_use_tmux;
-        let remote_os = ui.s_remote_os;
-        let windows_shell = ui.s_windows_shell;
-        let identity_id = ui.s_identity_id;
-        let host_id = self.remotes.get(idx).map(|h| h.id);
-        if let Some(h) = self.remotes.get_mut(idx) {
-            if !name.is_empty() {
-                h.name = name;
-            }
-            h.hostname = hostname;
-            h.port = port;
-            h.user = user;
-            h.auth = auth;
-            h.identity_file = identity;
-            h.jump_host = jump;
-            h.forward_agent = forward_agent;
-            h.compression = compression;
-            h.strict_host_key = strict;
-            h.keepalive_secs = keepalive;
-            h.extra_options = extra;
-            h.default_use_tmux = use_tmux;
-            h.os = remote_os;
-            h.windows_shell = windows_shell;
-            h.identity_id = identity_id;
-        }
-        if let Some(id) = host_id {
-            if identity_id.is_some() {
-                // Credentials come from the identity now — drop the host's own secret
-                // so it isn't left orphaned in the keychain.
-                let _ = crate::secrets::delete_remote_password(id);
-                self.session_passwords.remove(&id);
-                self.settings_ui.s_has_password = false;
-            } else if !password.is_empty() {
-                // The keychain copy is now authoritative; drop any session password.
-                self.session_passwords.remove(&id);
-                match crate::secrets::set_remote_password(id, &password) {
-                    Ok(()) => self.settings_ui.s_has_password = true,
-                    Err(e) => self.add_event(NotifKind::Error, t("Keychain error"), format!("{e}")),
-                }
-                self.settings_ui
-                    .s_password
-                    .update(cx, |s, cx| s.set_value(String::new(), window, cx));
-            }
-        }
-        self.persist_settings();
-        cx.notify();
-    }
-
-    fn add_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.remotes.push(RemoteHost::new(t("New host"), ""));
-        let idx = self.remotes.len() - 1;
-        self.persist_settings();
-        self.open_remote_editor(idx, window, cx);
-    }
-
-    fn delete_remote(&mut self, idx: usize, cx: &mut Context<Self>) {
-        if idx >= self.remotes.len() {
-            return;
-        }
-        let id = self.remotes[idx].id;
-        let _ = crate::secrets::delete_remote_password(id);
-        self.session_passwords.remove(&id);
-        self.remotes.remove(idx);
-        self.settings_ui.selected_remote = None;
-        self.persist_settings();
-        cx.notify();
-    }
-
-    // --- Shared login identities -------------------------------------------------
-
-    fn open_identity_editor(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.identities.get(idx).cloned() else {
-            return;
-        };
-        self.settings_ui.selected_identity = Some(idx);
-        self.settings_ui.id_auth = id.auth;
-        self.settings_ui.id_has_password = crate::secrets::has_identity_password(id.id);
-        let set =
-            |inp: &Entity<InputState>, v: String, cx: &mut Context<Self>, window: &mut Window| {
-                inp.update(cx, |s, cx| s.set_value(v, window, cx));
-            };
-        set(&self.settings_ui.id_name, id.name.clone(), cx, window);
-        set(&self.settings_ui.id_user, id.user.clone(), cx, window);
-        set(
-            &self.settings_ui.id_identity,
-            id.identity_file
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default(),
-            cx,
-            window,
-        );
-        // Never preload the password — it stays in the keychain.
-        set(&self.settings_ui.id_password, String::new(), cx, window);
-        cx.notify();
-    }
-
-    fn set_identity_auth(&mut self, auth: SshAuth, cx: &mut Context<Self>) {
-        self.settings_ui.id_auth = auth;
-        cx.notify();
-    }
-
-    /// Pick an SSH identity file via the OS file dialog, into the identity editor.
-    fn browse_identity_key_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some(t("Choose key")),
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(mut paths))) = receiver.await
-                && let Some(path) = paths.pop()
-            {
-                let _ = this.update_in(cx, |this, window, cx| {
-                    this.settings_ui.id_identity.update(cx, |s, cx| {
-                        s.set_value(path.display().to_string(), window, cx)
-                    });
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
-    }
-
-    fn save_identity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(idx) = self.settings_ui.selected_identity else {
-            return;
-        };
-        let ui = &self.settings_ui;
-        let name = ui.id_name.read(cx).value().trim().to_string();
-        let user = ui.id_user.read(cx).value().trim().to_string();
-        let identity = {
-            let v = ui.id_identity.read(cx).value().trim().to_string();
-            (!v.is_empty()).then(|| PathBuf::from(v))
-        };
-        let password = ui.id_password.read(cx).value().to_string();
-        let auth = ui.id_auth;
-        let id_uuid = self.identities.get(idx).map(|i| i.id);
-        if let Some(i) = self.identities.get_mut(idx) {
-            if !name.is_empty() {
-                i.name = name;
-            }
-            i.user = user;
-            i.auth = auth;
-            i.identity_file = identity;
-        }
-        if let Some(id) = id_uuid
-            && !password.is_empty()
-        {
-            self.session_passwords.remove(&id);
-            match crate::secrets::set_identity_password(id, &password) {
-                Ok(()) => self.settings_ui.id_has_password = true,
-                Err(e) => self.add_event(NotifKind::Error, t("Keychain error"), format!("{e}")),
-            }
-            self.settings_ui
-                .id_password
-                .update(cx, |s, cx| s.set_value(String::new(), window, cx));
-        }
-        self.persist_settings();
-        cx.notify();
-    }
-
-    fn add_identity(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.identities.push(Identity::new(t("New identity")));
-        let idx = self.identities.len() - 1;
-        self.persist_settings();
-        self.open_identity_editor(idx, window, cx);
-    }
-
-    fn delete_identity(&mut self, idx: usize, cx: &mut Context<Self>) {
-        if idx >= self.identities.len() {
-            return;
-        }
-        let id = self.identities[idx].id;
-        let _ = crate::secrets::delete_identity_password(id);
-        self.session_passwords.remove(&id);
-        // Detach any hosts that referenced it — they fall back to inline credentials.
-        for h in &mut self.remotes {
-            if h.identity_id == Some(id) {
-                h.identity_id = None;
-            }
-        }
-        self.identities.remove(idx);
-        self.settings_ui.selected_identity = None;
-        self.persist_settings();
-        cx.notify();
-    }
-
-    /// Verify a host's SSH config by opening a quick connection (background +
-    /// toast). Establishing the ControlMaster also makes the first pane instant.
-    fn test_remote_connection(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(host) = self.remotes.get(idx).cloned() else {
-            return;
-        };
-        // Password auth: always prompt for a password to test with (forgotten
-        // afterward), so a connection can be verified before saving anything.
-        if host.auth == SshAuth::Password {
-            self.prompt_password(host.id, PasswordAction::Verify(idx), window, cx);
-        } else {
-            self.run_ssh_check(idx, None, window, cx);
-        }
-    }
-
-    /// Run the connection test for host `idx` with an optional password (used once
-    /// for the test — not stored).
-    fn run_ssh_check(
-        &mut self,
-        idx: usize,
-        password: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(host) = self.remotes.get(idx).cloned() else {
-            return;
-        };
-        // Inline result in the editor (not a toast). A fresh, auth-forcing check
-        // (`ssh_verify`) so a warm ControlMaster / a working key can't make a bad
-        // password report success.
-        self.settings_ui.s_test = RemoteTestState::Testing;
-        cx.notify();
-        let host_for_err = host.clone();
-        let password_retry = password.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let res = cx
-                .background_executor()
-                .spawn(async move { integrations::ssh_verify(&host, password.as_deref()) })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.settings_ui.s_test = match res {
-                    Ok(()) => RemoteTestState::Ok(t("Connected").into()),
-                    Err(e) => {
-                        let msg = format!("{e}");
-                        let retry = SshRetry::VerifyHost {
-                            idx,
-                            password: password_retry,
-                        };
-                        if this.handle_ssh_error(&msg, Some(&host_for_err), retry, cx) {
-                            RemoteTestState::Failed(t("Host key changed — see dialog").into())
-                        } else {
-                            RemoteTestState::Failed(msg)
-                        }
-                    }
-                };
-                cx.notify();
-            });
-        })
-        .detach();
     }
 
     /// Set the editor's selected agent for the runner being edited.
@@ -24181,48 +18945,24 @@ impl MuxelApp {
                             .text_color(cx.theme().muted_foreground)
                             .child(t("Running terminals will be closed.")),
                     )
-                    // tmux-backed panes survive a quit by design; offer cleanup
-                    // per scope (local vs remote sessions).
+                    // tmux-backed panes survive a quit by design; offer cleanup.
                     .children({
-                        let sessions = self.tmux_sessions();
-                        let has_local = sessions.iter().any(|(_, _, remote)| !remote);
-                        let has_remote = sessions.iter().any(|(_, _, remote)| *remote);
-                        [
-                            has_local.then(|| {
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        Checkbox::new("quit-kill-tmux-local")
-                                            .checked(self.quit_kill_tmux_local)
-                                            .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                                                this.quit_kill_tmux_local = *c;
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        div().text_sm().child(t("Also kill local tmux sessions")),
-                                    )
-                            }),
-                            has_remote.then(|| {
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        Checkbox::new("quit-kill-tmux-remote")
-                                            .checked(self.quit_kill_tmux_remote)
-                                            .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                                                this.quit_kill_tmux_remote = *c;
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        div().text_sm().child(t("Also kill remote tmux sessions")),
-                                    )
-                            }),
-                        ]
+                        let has_local = !self.tmux_sessions().is_empty();
+                        [has_local.then(|| {
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Checkbox::new("quit-kill-tmux-local")
+                                        .checked(self.quit_kill_tmux_local)
+                                        .on_click(cx.listener(|this, c: &bool, _w, cx| {
+                                            this.quit_kill_tmux_local = *c;
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(div().text_sm().child(t("Also kill local tmux sessions")))
+                        })]
                         .into_iter()
                         .flatten()
                     })
@@ -24397,89 +19137,6 @@ impl MuxelApp {
             .into_any_element()
     }
 
-    /// The floating speech-to-text pill (recording / transcribing / error),
-    /// shown while `stt_state != Idle`. Modeled on the broadcast bar.
-    fn render_stt_bar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let (accent, label, recording, error, mic) = match &self.stt_state {
-            SttState::Recording => (
-                cx.theme().danger,
-                t("Recording…").to_string(),
-                true,
-                false,
-                false,
-            ),
-            SttState::Busy(l) => (cx.theme().accent, l.clone(), false, false, false),
-            SttState::Error { message, mic } => {
-                (cx.theme().danger, message.clone(), false, true, *mic)
-            }
-            SttState::Idle => (
-                cx.theme().muted_foreground,
-                String::new(),
-                false,
-                false,
-                false,
-            ),
-        };
-        // Only where the OS actually has a microphone permission screen to open.
-        let mic_settings = mic && crate::integrations::HAS_MICROPHONE_SETTINGS;
-        div()
-            .absolute()
-            .bottom(px(16.0))
-            .left_0()
-            .right_0()
-            .flex()
-            .justify_center()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_2()
-                    .max_w_full()
-                    .rounded(cx.theme().radius_lg)
-                    .bg(cx.theme().background)
-                    .border_1()
-                    .border_color(accent)
-                    .shadow_lg()
-                    .child(div().size(px(8.0)).rounded_full().bg(accent))
-                    .child(div().text_sm().child(label))
-                    .children(recording.then(|| {
-                        Button::new("stt-stop")
-                            .primary()
-                            .xsmall()
-                            .label(t("Stop"))
-                            .on_click(
-                                cx.listener(|this, _e, window, cx| this.toggle_speech(window, cx)),
-                            )
-                    }))
-                    .children(mic_settings.then(|| {
-                        Button::new("stt-mic-settings")
-                            .primary()
-                            .xsmall()
-                            .label(t("Open Settings"))
-                            .tooltip(t("Open the system microphone privacy settings"))
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                crate::integrations::open_microphone_settings();
-                                this.stt_state = SttState::Idle;
-                                cx.notify();
-                            }))
-                    }))
-                    .children(error.then(|| {
-                        Button::new("stt-dismiss")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Close)
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.stt_state = SttState::Idle;
-                                cx.notify();
-                            }))
-                    }))
-                    .into_any_element(),
-            )
-            .into_any_element()
-    }
-
     /// Get-started state for a workspace with **zero projects** (post terms
     /// screen, a fresh workspace is otherwise blank space): the mark, the two
     /// ways to add a project, and a pointer to the shortcut cheat sheet. No
@@ -24524,28 +19181,15 @@ impl MuxelApp {
                             .child(t("Add a project to start running agents side by side.")),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .pt_2()
-                            .child(
-                                Button::new("onboard-add-project")
-                                    .primary()
-                                    .icon(IconName::Plus)
-                                    .label(t("Add a project"))
-                                    .on_click(cx.listener(|this, _e, window, cx| {
-                                        this.new_project_dialog(window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("onboard-add-remote")
-                                    .ghost()
-                                    .label(t("New remote project (SSH)"))
-                                    .on_click(cx.listener(|this, _e, window, cx| {
-                                        this.open_remote_project_modal(window, cx)
-                                    })),
-                            ),
+                        div().flex().items_center().gap_2().pt_2().child(
+                            Button::new("onboard-add-project")
+                                .primary()
+                                .icon(IconName::Plus)
+                                .label(t("Add a project"))
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    this.new_project_dialog(window, cx)
+                                })),
+                        ),
                     )
                     .child(
                         div()
@@ -24656,201 +19300,6 @@ impl MuxelApp {
                             .max_h(px(480.0))
                             .overflow_y_scroll()
                             .child(list),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    /// The in-app updater modal: shows the current version + update state, and
-    /// (depending on install type) a Download/Install + Restart flow, or the
-    /// package-manager command for installs that can't self-update.
-    fn render_update_modal(&self, cx: &mut Context<Self>) -> AnyElement {
-        let muted = cx.theme().muted_foreground;
-        let self_updatable = self.install_kind.self_updatable();
-
-        let mut body = v_flex().gap_3().w_full().flex_1().min_h_0().child(
-            div().text_sm().text_color(muted).child(tf(
-                "Current version: {version}",
-                &[("version", crate::update::APP_VERSION)],
-            )),
-        );
-
-        match &self.update_state {
-            UpdateState::Idle => {
-                body = body.child(div().text_sm().child(t("Check for a newer version.")));
-            }
-            UpdateState::Checking => {
-                body = body.child(div().text_sm().child(t("Checking for updates…")));
-            }
-            UpdateState::UpToDate => {
-                body = body.child(div().text_sm().child(t("You’re on the latest version.")));
-            }
-            UpdateState::Available(info) => {
-                body = body.child(div().font_semibold().child(tf(
-                    "muxel {version} is available.",
-                    &[("version", &info.version.to_string())],
-                )));
-                let notes = info.notes.trim();
-                if !notes.is_empty() {
-                    // The full release notes as scrollable markdown, growing to
-                    // fill the (resizable) card.
-                    body = body.child(
-                        div().flex_1().min_h_0().child(
-                            gpui_component::text::markdown(notes.to_string())
-                                .selectable(true)
-                                .scrollable(true),
-                        ),
-                    );
-                }
-                if !self_updatable && let Some(hint) = self.install_kind.upgrade_hint() {
-                    let mut box_ = v_flex()
-                        .gap_1()
-                        .p_2()
-                        .rounded(cx.theme().radius)
-                        .bg(cx.theme().secondary)
-                        .text_xs();
-                    for line in hint.lines() {
-                        box_ = box_.child(div().child(line.to_string()));
-                    }
-                    body = body
-                        .child(
-                            div()
-                                .text_sm()
-                                .child(t("Update muxel with your package manager:")),
-                        )
-                        .child(box_);
-                }
-            }
-            UpdateState::Downloading => {
-                body = body.child(div().text_sm().child(t("Downloading and installing…")));
-            }
-            UpdateState::Ready(_) => {
-                body = body.child(
-                    div()
-                        .text_sm()
-                        .child(t("Update installed. Restart muxel to finish.")),
-                );
-            }
-            UpdateState::Error(e) => {
-                body = body.child(
-                    div()
-                        .text_sm()
-                        .child(tf("Update failed: {error}", &[("error", &e.to_string())])),
-                );
-            }
-        }
-
-        // Footer: Close + a state-specific primary action.
-        let mut footer = div().flex().gap_2().justify_end().pt_2().child(
-            Button::new("update-close")
-                .ghost()
-                .label(t("Close"))
-                .on_click(cx.listener(|this, _e, _w, cx| {
-                    this.show_update_modal = false;
-                    cx.notify();
-                })),
-        );
-        match &self.update_state {
-            UpdateState::Available(_) if self_updatable => {
-                footer = footer.child(
-                    Button::new("update-install")
-                        .primary()
-                        .label(t("Download & Install"))
-                        .on_click(cx.listener(|this, _e, _w, cx| this.start_update_download(cx))),
-                );
-            }
-            UpdateState::Available(_) => {
-                footer = footer.child(
-                    Button::new("update-releases")
-                        .primary()
-                        .label(t("Open releases page"))
-                        .on_click(
-                            cx.listener(|_t, _e, _w, cx| cx.open_url(crate::update::RELEASES_URL)),
-                        ),
-                );
-            }
-            UpdateState::Ready(_) => {
-                footer = footer.child(
-                    Button::new("update-restart")
-                        .primary()
-                        .label(t("Restart now"))
-                        .on_click(cx.listener(|this, _e, _w, cx| this.apply_update_restart(cx))),
-                );
-            }
-            UpdateState::Error(_) => {
-                footer = footer.child(
-                    Button::new("update-retry")
-                        .label(t("Check again"))
-                        .on_click(cx.listener(|this, _e, _w, cx| this.check_for_updates(cx))),
-                );
-            }
-            UpdateState::Idle | UpdateState::UpToDate => {
-                footer = footer.child(
-                    Button::new("update-check")
-                        .label(t("Check now"))
-                        .on_click(cx.listener(|this, _e, _w, cx| this.check_for_updates(cx))),
-                );
-            }
-            UpdateState::Checking | UpdateState::Downloading => {}
-        }
-
-        modal_backdrop()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _ev, _w, cx| {
-                    this.show_update_modal = false;
-                    cx.notify();
-                }),
-            )
-            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _w, cx| {
-                if let Some((start, base)) = this.update_resize {
-                    let w = (f32::from(base.width) + f32::from(ev.position.x - start.x)).max(420.0);
-                    let h =
-                        (f32::from(base.height) + f32::from(ev.position.y - start.y)).max(320.0);
-                    this.update_modal_size = size(px(w), px(h));
-                    cx.notify();
-                }
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _ev, _w, _cx| this.update_resize = None),
-            )
-            .child(
-                div()
-                    .relative()
-                    .w(self.update_modal_size.width)
-                    .h(self.update_modal_size.height)
-                    .max_w(relative(0.95))
-                    .max_h(relative(0.9))
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .p_5()
-                    .bg(cx.theme().background)
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .rounded(cx.theme().radius_lg)
-                    .shadow_lg()
-                    .on_mouse_down(MouseButton::Left, |_ev, _w, cx| cx.stop_propagation())
-                    .child(div().text_lg().font_semibold().child(t("Software update")))
-                    .child(body)
-                    .child(footer)
-                    .child(
-                        // Bottom-right corner: drag to resize the modal.
-                        div()
-                            .absolute()
-                            .bottom_0()
-                            .right_0()
-                            .size(px(18.0))
-                            .cursor(CursorStyle::ResizeUpLeftDownRight)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
-                                    cx.stop_propagation();
-                                    this.update_resize =
-                                        Some((ev.position, this.update_modal_size));
-                                }),
-                            ),
                     ),
             )
             .into_any_element()
@@ -25039,15 +19488,10 @@ impl MuxelApp {
             (t("Appearance"), SettingsSection::Appearance),
             (t("Editor"), SettingsSection::Editor),
             (t("Behavior"), SettingsSection::Behavior),
-            (t("Speech"), SettingsSection::Speech),
-            (t("Read Aloud"), SettingsSection::ReadAloud),
             (t("Agents"), SettingsSection::Agents),
-            (t("Grok Bot"), SettingsSection::GrokBot),
             (t("Runners"), SettingsSection::Runners),
             (t("Snippets"), SettingsSection::Snippets),
             (t("Loops"), SettingsSection::Loops),
-            (t("Remotes"), SettingsSection::Remotes),
-            (t("Identities"), SettingsSection::Identities),
             (t("Projects"), SettingsSection::Projects),
             (t("Keybindings"), SettingsSection::Keybindings),
         ];
@@ -25069,15 +19513,10 @@ impl MuxelApp {
             SettingsSection::Appearance => self.render_settings_appearance(cx),
             SettingsSection::Editor => self.render_settings_editor(cx),
             SettingsSection::Behavior => self.render_settings_behavior(cx),
-            SettingsSection::Speech => self.render_settings_speech(cx),
-            SettingsSection::ReadAloud => self.render_settings_read_aloud(cx),
             SettingsSection::Agents => self.render_settings_agents(cx),
-            SettingsSection::GrokBot => self.render_settings_grok_bot(cx),
             SettingsSection::Runners => self.render_settings_runners(cx),
             SettingsSection::Snippets => self.render_settings_snippets(cx),
             SettingsSection::Loops => self.render_settings_loops(cx),
-            SettingsSection::Remotes => self.render_settings_remotes(cx),
-            SettingsSection::Identities => self.render_settings_identities(cx),
             SettingsSection::Projects => self.render_settings_projects(cx),
             SettingsSection::Keybindings => self.render_settings_keybindings(content_w, cx),
         };
@@ -26078,571 +20517,6 @@ impl MuxelApp {
             .into_any_element()
     }
 
-    fn render_settings_remotes(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut list = v_flex().w(rems(10.0)).flex_none().gap_1();
-        for (idx, h) in self.remotes.iter().enumerate() {
-            let selected = self.settings_ui.selected_remote == Some(idx);
-            let fg = if selected {
-                cx.theme().sidebar_accent_foreground
-            } else {
-                cx.theme().foreground
-            };
-            let label = if h.name.is_empty() {
-                "(unnamed)".to_string()
-            } else {
-                h.name.clone()
-            };
-            let mut row =
-                div()
-                    .id(SharedString::from(format!("remote-row-{idx}")))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .w_full()
-                    .px_2()
-                    .py_1()
-                    .rounded(cx.theme().radius)
-                    .cursor_pointer()
-                    .text_color(fg)
-                    .on_click(cx.listener(move |this, _e, window, cx| {
-                        this.open_remote_editor(idx, window, cx)
-                    }))
-                    .child(Icon::new(IconName::Network).small())
-                    .child(div().text_sm().child(label));
-            if selected {
-                row = row.bg(cx.theme().sidebar_accent);
-            } else {
-                row = row.hover(|s| s.bg(cx.theme().accent));
-            }
-            list = list.child(row);
-        }
-        list = list.child(
-            Button::new("add-remote")
-                .ghost()
-                .icon(IconName::Plus)
-                .label(t("Add host"))
-                .on_click(cx.listener(|this, _e, window, cx| this.add_remote(window, cx))),
-        );
-
-        let editor = match self.settings_ui.selected_remote {
-            Some(idx) if idx < self.remotes.len() => self.render_remote_editor(idx, cx),
-            _ => div()
-                .p_4()
-                .text_color(cx.theme().muted_foreground)
-                .child(t("Select a host to edit, or add one. Hosts are used when creating remote projects."))
-                .into_any_element(),
-        };
-
-        div()
-            .flex()
-            .flex_row()
-            .gap_4()
-            .child(list)
-            .child(div().flex_1().min_w_0().child(editor))
-            .into_any_element()
-    }
-
-    fn render_remote_editor(&self, idx: usize, cx: &mut Context<Self>) -> AnyElement {
-        let ui = &self.settings_ui;
-        let auth = ui.s_auth;
-        let auth_btn = |label: &'static str, val: SshAuth, id: &'static str| {
-            Button::new(id)
-                .ghost()
-                .selected(auth == val)
-                .label(label)
-                .on_click(cx.listener(move |this, _e, _w, cx| this.set_remote_auth(val, cx)))
-        };
-
-        // Credentials: inline, or drawn from a shared login identity.
-        let cred_picker = {
-            let mut row = div().flex().flex_wrap().gap_1().child(
-                Button::new("cred-inline")
-                    .ghost()
-                    .selected(ui.s_identity_id.is_none())
-                    .label(t("Inline"))
-                    .on_click(cx.listener(|this, _e, _w, cx| {
-                        this.settings_ui.s_identity_id = None;
-                        cx.notify();
-                    })),
-            );
-            for id in &self.identities {
-                let iid = id.id;
-                row = row.child(
-                    Button::new(SharedString::from(format!("cred-{}", iid.simple())))
-                        .ghost()
-                        .selected(ui.s_identity_id == Some(iid))
-                        .icon(IconName::CircleUser)
-                        .label(id.name.clone())
-                        .on_click(cx.listener(move |this, _e, _w, cx| {
-                            this.settings_ui.s_identity_id = Some(iid);
-                            cx.notify();
-                        })),
-                );
-            }
-            row
-        };
-
-        let mut form = v_flex()
-            .gap_2()
-            .w_full()
-            .max_w(px(560.0))
-            .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&ui.s_name)))
-            .child(self.settings_label(&t("Host (or ~/.ssh/config alias)"), cx))
-            .child(Self::wide_input(Input::new(&ui.s_host)))
-            .child(self.settings_label(&t("Credentials"), cx))
-            .child(cred_picker)
-            .child(self.settings_label(&t("Port"), cx))
-            .child(Input::new(&ui.s_port));
-
-        if ui.s_identity_id.is_none() {
-            // Inline credentials: user + auth + key/password on the host itself.
-            form = form
-                .child(self.settings_label(&t("User"), cx))
-                .child(Self::wide_input(Input::new(&ui.s_user)))
-                .child(self.settings_label(&t("Authentication"), cx))
-                .child(
-                    div()
-                        .flex()
-                        .gap_1()
-                        .child(auth_btn("ssh-agent", SshAuth::Agent, "remote-auth-agent"))
-                        .child(auth_btn("Key file", SshAuth::Key, "remote-auth-key"))
-                        .child(auth_btn("Password", SshAuth::Password, "remote-auth-pw")),
-                );
-            if auth == SshAuth::Key {
-                form = form
-                    .child(self.settings_label(&t("Identity file"), cx))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .items_center()
-                            .child(v_flex().flex_1().child(Input::new(&ui.s_identity)))
-                            .child(
-                                Button::new("remote-browse-key")
-                                    .ghost()
-                                    .icon(IconName::Folder)
-                                    .label(t("Browse"))
-                                    .on_click(cx.listener(|this, _e, window, cx| {
-                                        this.browse_identity_file(window, cx)
-                                    })),
-                            ),
-                    );
-            } else if auth == SshAuth::Password {
-                let hint = if ui.s_has_password {
-                    t("A password is saved in the OS keychain. Type a new one to replace it.")
-                } else {
-                    t("Stored securely in the OS keychain — never in muxel's config.")
-                };
-                form = form
-                    .child(self.settings_label(&t("Password"), cx))
-                    .child(Self::wide_input(Input::new(&ui.s_password)))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(hint),
-                    );
-                // Password auth feeds the secret to ssh via `sshpass`. Warn if it's
-                // unavailable (Windows has no sshpass — use a key or ssh-agent there).
-                if !self.sshpass_available {
-                    let warn = if cfg!(target_os = "windows") {
-                        "Password auth needs `sshpass`, which isn't available on Windows. \
-                         Use a key file or ssh-agent instead."
-                    } else {
-                        "`sshpass` not found on PATH — install it for password auth, or use \
-                         a key file / ssh-agent. (Windows can't use password auth.)"
-                    };
-                    form = form.child(div().text_xs().text_color(cx.theme().warning).child(warn));
-                }
-            }
-        } else {
-            // Credentials come from a shared identity — show which, or warn if it's gone.
-            match self
-                .identities
-                .iter()
-                .find(|i| Some(i.id) == ui.s_identity_id)
-                .map(|i| i.name.clone())
-            {
-                Some(name) => {
-                    form = form.child(div().text_xs().text_color(cx.theme().muted_foreground).child(
-                        tf(
-                            "User, authentication & key/password come from the “{name}” identity.",
-                            &[("name", &name)],
-                        ),
-                    ));
-                }
-                None => {
-                    form = form.child(div().text_xs().text_color(cx.theme().warning).child(t(
-                        "The selected identity no longer exists — this host falls back to \
-                         ssh-agent until you pick another or switch to Inline.",
-                    )));
-                }
-            }
-        }
-
-        let forward = ui.s_forward_agent;
-        let compression = ui.s_compression;
-        let use_tmux = ui.s_use_tmux;
-        let remote_os = ui.s_remote_os;
-        let win_shell = ui.s_windows_shell;
-        let os_btn = |label: &'static str, val: RemoteOs, id: &'static str| {
-            Button::new(id)
-                .ghost()
-                .selected(remote_os == val)
-                .label(label)
-                .on_click(cx.listener(move |this, _e, _w, cx| {
-                    this.settings_ui.s_remote_os = val;
-                    cx.notify();
-                }))
-        };
-        let shell_btn = |label: &'static str, val: WindowsShell, id: &'static str| {
-            Button::new(id)
-                .ghost()
-                .selected(win_shell == val)
-                .label(label)
-                .on_click(cx.listener(move |this, _e, _w, cx| {
-                    this.settings_ui.s_windows_shell = val;
-                    cx.notify();
-                }))
-        };
-        form = form
-            .child(self.settings_label(&t("Remote operating system"), cx))
-            .child(
-                div()
-                    .flex()
-                    .gap_1()
-                    .child(os_btn(
-                        "Unix (Linux/macOS)",
-                        RemoteOs::Unix,
-                        "remote-os-unix",
-                    ))
-                    .child(os_btn("Windows", RemoteOs::Windows, "remote-os-windows")),
-            )
-            .child(self.settings_label(&t("Jump host (ProxyJump, optional)"), cx))
-            .child(Self::wide_input(Input::new(&ui.s_jump)))
-            .child(
-                self.check_row(
-                    Checkbox::new("remote-forward-agent")
-                        .checked(forward)
-                        .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                            this.settings_ui.s_forward_agent = *c;
-                            cx.notify();
-                        })),
-                    &t("Forward the ssh-agent (-A)"),
-                ),
-            )
-            .child(
-                self.check_row(
-                    Checkbox::new("remote-compression")
-                        .checked(compression)
-                        .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                            this.settings_ui.s_compression = *c;
-                            cx.notify();
-                        })),
-                    &t("Enable compression (-C) — helps on slow or high-latency links"),
-                ),
-            );
-
-        // Persistence and the pane shell are the two places the families really
-        // differ, so the form asks a different question for each.
-        if remote_os == RemoteOs::Windows {
-            form = form
-                .child(self.settings_label(&t("Pane shell"), cx))
-                .child(
-                    div()
-                        .flex()
-                        .gap_1()
-                        .child(shell_btn(
-                            "PowerShell",
-                            WindowsShell::PowerShell,
-                            "win-shell-ps",
-                        ))
-                        .child(shell_btn("pwsh 7+", WindowsShell::Pwsh, "win-shell-pwsh"))
-                        .child(shell_btn("cmd.exe", WindowsShell::Cmd, "win-shell-cmd")),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(t(
-                            "Windows has no tmux, so a pane here lasts as long as its SSH \
-                     connection. On reconnect muxel relaunches the pane and the agent \
-                     resumes its saved conversation.",
-                        )),
-                );
-        } else {
-            form = form.child(
-                self.check_row(
-                    Checkbox::new("remote-tmux")
-                        .checked(use_tmux)
-                        .on_click(cx.listener(|this, c: &bool, _w, cx| {
-                            this.settings_ui.s_use_tmux = *c;
-                            cx.notify();
-                        })),
-                    &t("Run remote panes in a persistent tmux session (survives disconnects)"),
-                ),
-            );
-        }
-
-        form = form
-            .child(self.settings_label(&t("StrictHostKeyChecking (blank = accept-new)"), cx))
-            .child(Self::wide_input(Input::new(&ui.s_strict)))
-            .child(self.settings_label(
-                &t("Keepalive — ServerAliveInterval secs (blank = 20s default; 0 disables)"),
-                cx,
-            ))
-            .child(Self::wide_input(Input::new(&ui.s_keepalive)))
-            .child(self.settings_label(&t("Extra ssh -o options (one per line)"), cx))
-            .child(Self::wide_input(Input::new(&ui.s_extra).h(px(60.0))));
-
-        // Inline Test-connection result, above the buttons.
-        form.children(match &self.settings_ui.s_test {
-            RemoteTestState::Idle => None,
-            RemoteTestState::Testing => Some(
-                div()
-                    .pt_1()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t("Connecting…"))
-                    .into_any_element(),
-            ),
-            RemoteTestState::Ok(msg) => Some(
-                div()
-                    .pt_1()
-                    .text_xs()
-                    .text_color(cx.theme().success)
-                    .child(format!("✓ {msg}"))
-                    .into_any_element(),
-            ),
-            RemoteTestState::Failed(msg) => Some(
-                div()
-                    .pt_1()
-                    .min_w_0()
-                    .text_xs()
-                    .text_color(cx.theme().danger)
-                    .child(format!("✗ {msg}"))
-                    .into_any_element(),
-            ),
-        })
-        .child(
-            div()
-                .flex()
-                .gap_2()
-                .pt_2()
-                .child(
-                    Button::new("test-remote")
-                        .ghost()
-                        .icon(IconName::Network)
-                        .label(t("Test connection"))
-                        .on_click(cx.listener(move |this, _e, window, cx| {
-                            this.save_remote(window, cx);
-                            this.test_remote_connection(idx, window, cx);
-                        })),
-                )
-                .child(
-                    Button::new("save-remote")
-                        .primary()
-                        .label(t("Save"))
-                        .on_click(cx.listener(|this, _e, window, cx| this.save_remote(window, cx))),
-                )
-                .child(
-                    Button::new("del-remote")
-                        .ghost()
-                        .label(t("Delete"))
-                        .on_click(cx.listener(move |this, _e, _w, cx| {
-                            let name = this
-                                .remotes
-                                .get(idx)
-                                .map(|h| h.name.clone())
-                                .unwrap_or_default();
-                            this.request_confirm(
-                                t("Delete host?"),
-                                tf(
-                                    "The “{name}” SSH host and its saved password will be removed.",
-                                    &[("name", &name)],
-                                ),
-                                t("Delete"),
-                                ConfirmAction::DeleteRemote(idx),
-                                cx,
-                            )
-                        })),
-                ),
-        )
-        .into_any_element()
-    }
-
-    fn render_settings_identities(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mut list = v_flex().w(rems(10.0)).flex_none().gap_1();
-        for (idx, id) in self.identities.iter().enumerate() {
-            let selected = self.settings_ui.selected_identity == Some(idx);
-            let fg = if selected {
-                cx.theme().sidebar_accent_foreground
-            } else {
-                cx.theme().foreground
-            };
-            let label = if id.name.is_empty() {
-                "(unnamed)".to_string()
-            } else {
-                id.name.clone()
-            };
-            let mut row = div()
-                .id(SharedString::from(format!("identity-row-{idx}")))
-                .flex()
-                .items_center()
-                .gap_2()
-                .w_full()
-                .px_2()
-                .py_1()
-                .rounded(cx.theme().radius)
-                .cursor_pointer()
-                .text_color(fg)
-                .on_click(cx.listener(move |this, _e, window, cx| {
-                    this.open_identity_editor(idx, window, cx)
-                }))
-                .child(Icon::new(IconName::CircleUser).small())
-                .child(div().text_sm().child(label));
-            if selected {
-                row = row.bg(cx.theme().sidebar_accent);
-            } else {
-                row = row.hover(|s| s.bg(cx.theme().accent));
-            }
-            list = list.child(row);
-        }
-        list = list.child(
-            Button::new("add-identity")
-                .ghost()
-                .icon(IconName::Plus)
-                .label(t("Add identity"))
-                .on_click(cx.listener(|this, _e, window, cx| this.add_identity(window, cx))),
-        );
-
-        let editor = match self.settings_ui.selected_identity {
-            Some(idx) if idx < self.identities.len() => self.render_identity_editor(idx, cx),
-            _ => div()
-                .p_4()
-                .text_color(cx.theme().muted_foreground)
-                .child(t(
-                    "Select an identity to edit, or add one. An identity is a reusable login \
-                     (user + auth + key/password) that multiple hosts can share.",
-                ))
-                .into_any_element(),
-        };
-
-        div()
-            .flex()
-            .flex_row()
-            .gap_4()
-            .child(list)
-            .child(div().flex_1().min_w_0().child(editor))
-            .into_any_element()
-    }
-
-    fn render_identity_editor(&self, idx: usize, cx: &mut Context<Self>) -> AnyElement {
-        let ui = &self.settings_ui;
-        let auth = ui.id_auth;
-        let auth_btn = |label: &'static str, val: SshAuth, id: &'static str| {
-            Button::new(id)
-                .ghost()
-                .selected(auth == val)
-                .label(label)
-                .on_click(cx.listener(move |this, _e, _w, cx| this.set_identity_auth(val, cx)))
-        };
-
-        let mut form = v_flex()
-            .gap_2()
-            .w_full()
-            .max_w(px(560.0))
-            .child(self.settings_label(&t("Name"), cx))
-            .child(Self::wide_input(Input::new(&ui.id_name)))
-            .child(self.settings_label(&t("User"), cx))
-            .child(Self::wide_input(Input::new(&ui.id_user)))
-            .child(self.settings_label(&t("Authentication"), cx))
-            .child(
-                div()
-                    .flex()
-                    .gap_1()
-                    .child(auth_btn("ssh-agent", SshAuth::Agent, "id-auth-agent"))
-                    .child(auth_btn("Key file", SshAuth::Key, "id-auth-key"))
-                    .child(auth_btn("Password", SshAuth::Password, "id-auth-pw")),
-            );
-
-        if auth == SshAuth::Key {
-            form = form
-                .child(self.settings_label(&t("Identity file"), cx))
-                .child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .items_center()
-                        .child(v_flex().flex_1().child(Input::new(&ui.id_identity)))
-                        .child(
-                            Button::new("id-browse-key")
-                                .ghost()
-                                .icon(IconName::Folder)
-                                .label(t("Browse"))
-                                .on_click(cx.listener(|this, _e, window, cx| {
-                                    this.browse_identity_key_file(window, cx)
-                                })),
-                        ),
-                );
-        } else if auth == SshAuth::Password {
-            let hint = if ui.id_has_password {
-                t("A password is saved in the OS keychain. Type a new one to replace it.")
-            } else {
-                t("Stored securely in the OS keychain — never in muxel's config.")
-            };
-            form = form
-                .child(self.settings_label(&t("Password"), cx))
-                .child(Self::wide_input(Input::new(&ui.id_password)))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(hint),
-                );
-        }
-
-        form.child(
-            div()
-                .flex()
-                .gap_2()
-                .pt_2()
-                .child(
-                    Button::new("save-identity")
-                        .primary()
-                        .label(t("Save"))
-                        .on_click(
-                            cx.listener(|this, _e, window, cx| this.save_identity(window, cx)),
-                        ),
-                )
-                .child(
-                    Button::new("del-identity")
-                        .ghost()
-                        .label(t("Delete"))
-                        .on_click(cx.listener(move |this, _e, _w, cx| {
-                            let name = this
-                                .identities
-                                .get(idx)
-                                .map(|i| i.name.clone())
-                                .unwrap_or_default();
-                            this.request_confirm(
-                                t("Delete identity?"),
-                                tf(
-                                    "The “{name}” login identity and its saved password will be \
-                                     removed; hosts using it fall back to inline credentials.",
-                                    &[("name", &name)],
-                                ),
-                                t("Delete"),
-                                ConfirmAction::DeleteIdentity(idx),
-                                cx,
-                            )
-                        })),
-                ),
-        )
-        .into_any_element()
-    }
-
     fn render_preset_editor(&self, idx: usize, cx: &mut Context<Self>) -> AnyElement {
         let ui = &self.settings_ui;
         let inj = ui.p_injection.clone();
@@ -27165,16 +21039,8 @@ impl Render for MuxelApp {
                 .and_then(|l| l.leaf_containing(max))
                 .cloned()
         });
-        let failed_remote = self.workspace.active_project.and_then(|pid| {
-            self.remote_connect_failed
-                .get(&pid)
-                .filter(|_| !self.project_has_live_panes(pid))
-                .map(|m| (pid, m.clone()))
-        });
         let main_content: AnyElement = if self.show_dashboard {
             self.render_dashboard(cx)
-        } else if let Some((fpid, msg)) = failed_remote {
-            self.render_remote_connect_failed(fpid, &msg, cx)
         } else if let Some(leaf) = maximized_here {
             self.render_pane(&leaf, cx)
         } else {
@@ -27388,18 +21254,8 @@ impl Render for MuxelApp {
                     .then(|| self.render_search_palette(cx)),
             )
             .children(self.show_find_panel.then(|| self.render_find_panel(cx)))
-            .children(self.show_update_modal.then(|| self.render_update_modal(cx)))
             .children(self.show_quit_confirm.then(|| self.render_quit_modal(cx)))
             .children(self.git_modal.is_some().then(|| self.render_git_modal(cx)))
-            .children(
-                self.show_new_remote
-                    .then(|| self.render_remote_project_modal(cx)),
-            )
-            .children(
-                self.password_prompt
-                    .is_some()
-                    .then(|| self.render_password_prompt(cx)),
-            )
             .children(self.show_keys.then(|| self.render_keys_overlay(cx)))
             .children(
                 self.term_search
@@ -27407,7 +21263,6 @@ impl Render for MuxelApp {
                     .then(|| self.render_term_search_bar(cx)),
             )
             .children(self.broadcasting.then(|| self.render_broadcast_bar(cx)))
-            .children((self.stt_state != SttState::Idle).then(|| self.render_stt_bar(cx)))
             .children(
                 (!self.pending_worktree_dispose.is_empty())
                     .then(|| self.render_worktree_dispose_modal(cx)),
@@ -27828,181 +21683,6 @@ mod restore_wave_policy_tests {
             restore_wave_decision(4, 6, true, true, false),
             RestoreWaveDecision::Launch { wave_end: 6 }
         );
-    }
-}
-
-#[cfg(test)]
-mod host_connects_tests {
-    use super::{HostConnects, HostTurn};
-    use std::time::{Duration, Instant};
-    use uuid::Uuid;
-
-    #[test]
-    fn one_project_per_host_opens_the_connection() {
-        let mut hosts = HostConnects::default();
-        let t0 = Instant::now();
-        let (rhel, mac) = (Uuid::new_v4(), Uuid::new_v4());
-        let (a, b, c, d) = (
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-            Uuid::new_v4(),
-        );
-
-        assert_eq!(hosts.begin(rhel, a, false, t0), HostTurn::Lead);
-        // The host's other projects wait on it (once each)...
-        assert_eq!(hosts.begin(rhel, b, true, t0), HostTurn::Wait);
-        assert_eq!(hosts.begin(rhel, c, false, t0), HostTurn::Wait);
-        assert_eq!(hosts.begin(rhel, b, true, t0), HostTurn::Wait);
-        // ...while another host connects independently.
-        assert_eq!(hosts.begin(mac, d, false, t0), HostTurn::Lead);
-
-        let waiting = hosts.finish(rhel, HostTurn::Lead, true, t0);
-        assert_eq!(waiting, vec![(b, true), (c, false)]);
-        // Released, they all ride the warm master together — no second leader
-        // queueing the rest behind it one round trip at a time.
-        for (pid, defer) in waiting {
-            assert_eq!(hosts.begin(rhel, pid, defer, t0), HostTurn::Ride);
-            assert!(hosts.finish(rhel, HostTurn::Ride, true, t0).is_empty());
-        }
-        // Long after, the master may have gone: the next connect leads again.
-        let later = t0 + HostConnects::WARM + Duration::from_secs(1);
-        assert_eq!(hosts.begin(rhel, a, false, later), HostTurn::Lead);
-    }
-
-    #[test]
-    fn a_failed_connect_cools_its_host() {
-        let mut hosts = HostConnects::default();
-        let t0 = Instant::now();
-        let rhel = Uuid::new_v4();
-        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-        assert_eq!(hosts.begin(rhel, a, false, t0), HostTurn::Lead);
-        assert_eq!(hosts.begin(rhel, b, false, t0), HostTurn::Wait);
-        // Its waiters share the failure rather than each trying on their own.
-        assert_eq!(
-            hosts.finish(rhel, HostTurn::Lead, false, t0),
-            vec![(b, false)]
-        );
-        assert_eq!(hosts.begin(rhel, b, false, t0), HostTurn::Lead);
-    }
-
-    #[test]
-    fn a_host_is_announced_once_and_again_after_it_failed() {
-        let mut hosts = HostConnects::default();
-        let t0 = Instant::now();
-        let rhel = Uuid::new_v4();
-        hosts.finish(rhel, HostTurn::Lead, true, t0);
-        assert!(hosts.announce(rhel));
-        // Its other projects connecting later say nothing new.
-        assert!(!hosts.announce(rhel));
-        assert!(!hosts.announce(rhel));
-        // A failed connect forgets it, so its return is news again.
-        hosts.finish(rhel, HostTurn::Ride, false, t0);
-        assert!(hosts.announce(rhel));
-    }
-}
-
-#[cfg(test)]
-mod readings_tests {
-    use super::{ReadState, Readings};
-    use uuid::Uuid;
-
-    fn pieces(n: usize) -> Vec<String> {
-        (0..n).map(|i| format!("Sentence {i}.")).collect()
-    }
-
-    /// Read `pane` from the top, as the app does: hush, begin, load.
-    fn read(r: &mut Readings, pane: Uuid, at: Option<usize>, n: usize) -> u64 {
-        r.hush(at);
-        let generation = r.begin(Some(pane));
-        assert!(r.loaded(generation, Some((pieces(n), 0))));
-        generation
-    }
-
-    #[test]
-    fn a_reading_pauses_resumes_and_finishes() {
-        let mut r = Readings::default();
-        let a = Uuid::new_v4();
-        assert_eq!(r.state(a), ReadState::Idle);
-        let first = read(&mut r, a, None, 5);
-        assert_eq!(r.state(a), ReadState::Playing);
-
-        // Paused on piece 2: that is where it resumes.
-        r.hush(Some(2));
-        assert_eq!(r.state(a), ReadState::Paused);
-        assert_eq!(r.resume_point(a), Some((pieces(5), 2)));
-        // The old voice ending now is not the reading finishing.
-        assert!(!r.finished(first));
-
-        let resumed = r.begin(Some(a));
-        assert!(r.loaded(resumed, r.resume_point(a)));
-        assert_eq!(r.state(a), ReadState::Playing);
-        assert!(r.finished(resumed));
-        assert_eq!(r.state(a), ReadState::Idle);
-    }
-
-    #[test]
-    fn reading_another_pane_pauses_the_first_in_place() {
-        let mut r = Readings::default();
-        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-        read(&mut r, a, None, 5);
-        // B starts while A is on piece 3.
-        read(&mut r, b, Some(3), 4);
-        assert_eq!(r.state(a), ReadState::Paused);
-        assert_eq!(r.state(b), ReadState::Playing);
-        assert_eq!(r.resume_point(a).map(|(_, next)| next), Some(3));
-        // Starting A over: B keeps its place, A goes back to the top.
-        r.hush(Some(1));
-        assert!(r.rewind(a));
-        assert_eq!(r.resume_point(a).map(|(_, next)| next), Some(0));
-        assert_eq!(r.resume_point(b).map(|(_, next)| next), Some(1));
-    }
-
-    #[test]
-    fn stopping_forgets_and_quiets_the_queue() {
-        let mut r = Readings::default();
-        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        read(&mut r, a, None, 3);
-        // Auto-reads wait their turn while A speaks.
-        assert!(!r.enqueue(b));
-        assert!(!r.enqueue(b));
-        assert_eq!(r.queue.len(), 1);
-        // Stopping a paused pane leaves the voice and queue alone...
-        read(&mut r, c, Some(1), 2);
-        assert!(!r.stop(a));
-        assert_eq!(r.state(a), ReadState::Idle);
-        assert_eq!(r.queue.len(), 1);
-        // ...stopping the one speaking silences it and drops the queue.
-        assert!(r.stop(c));
-        assert_eq!(r.state(c), ReadState::Idle);
-        assert!(r.queue.is_empty());
-        assert!(r.enqueue(b), "the voice is free again");
-    }
-
-    #[test]
-    fn a_reading_stopped_while_gathering_leaves_nothing_behind() {
-        let mut r = Readings::default();
-        let a = Uuid::new_v4();
-        let generation = r.begin(Some(a));
-        assert_eq!(r.state(a), ReadState::Playing);
-        r.hush(None); // paused before a word was said
-        assert!(!r.loaded(generation, Some((pieces(3), 0))));
-        assert_eq!(r.state(a), ReadState::Idle);
-
-        // Nothing to read: the notice that says so is not the pane's reading.
-        let generation = r.begin(Some(a));
-        assert!(r.loaded(generation, None));
-        assert_eq!(r.state(a), ReadState::Idle);
-        assert!(r.finished(generation));
-    }
-
-    #[test]
-    fn a_pause_at_the_very_end_is_a_finished_reading() {
-        let mut r = Readings::default();
-        let a = Uuid::new_v4();
-        read(&mut r, a, None, 2);
-        r.hush(Some(2));
-        assert_eq!(r.state(a), ReadState::Idle);
     }
 }
 
