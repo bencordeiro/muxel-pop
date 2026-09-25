@@ -6,6 +6,8 @@ muxel is an Agent Development Environment (ADE) — a native desktop terminal mu
 
 It's built for driving multiple agents across git worktrees — one window per branch, no tmux keybindings required. See [FEATURES.md](FEATURES.md) for the full feature catalogue.
 
+![muxel running three pi agents in tiled panes under the single merged top bar](docs/img1.png)
+
 ---
 
 ## Install & run
