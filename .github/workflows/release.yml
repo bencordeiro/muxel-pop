@@ -201,11 +201,11 @@ jobs:
           arch="${{ matrix.arch }}"
           unset DISPLAY WAYLAND_DISPLAY
           sudo apt-get install -y rpm2cpio cpio
-          if [ "$arch" = x86_64 ]; then expect_machine=X86-64; else expect_machine=AArch64; fi
+          if [ "$arch" = x86_64 ]; then expect_machine="x86-64"; else expect_machine="aarch64"; fi
           check() {
             bin="$1"
             test -x "$bin"
-            file "$bin" | grep -q "$expect_machine"
+            file "$bin" | grep -qi "$expect_machine"
             if ldd "$bin" | grep -q "not found"; then ldd "$bin"; exit 1; fi
           }
           dpkg-deb -x target/debian/*.deb deb-root
